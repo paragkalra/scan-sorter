@@ -83,16 +83,19 @@ class _Seen:
     # True when we watched this file arrive with working inotify: then only a
     # close event proves the writer is done, however long it pauses.
     needs_close: bool
-    # From inotify: handles open on this file, and whether a writer closed it
-    # after the last write (both reset when a new file takes the name).
-    closed: bool = False
+
+
+@dataclass
+class _Handles:
+    """What inotify told us about one file, kept by name and carried across
+    renames inside the inbox (so a temp file renamed into place keeps its
+    open writers)."""
+
+    watched: bool  # we saw it created here, so we know all its handles
     opens: int = 0
+    closed: bool = False  # a writer closed it after its last write
 
     def apply(self, mask: int) -> None:
-        if mask & (IN_CREATE | IN_DELETE | IN_MOVED_FROM):
-            self.opens, self.closed = 0, False
-        if mask & IN_MOVED_TO:
-            self.opens, self.closed = 0, True
         if mask & IN_OPEN:
             self.opens += 1
         if mask & IN_MODIFY:
@@ -134,17 +137,21 @@ class TransferGate:
         self.max_wait_seconds = max_wait_seconds
         self._clock = clock
         self._seen: dict[str, _Seen] = {}
+        self._handles: dict[str, _Handles] = {}
+        # Renames in progress, by inotify cookie, with the poll they started in.
+        self._moving: dict[int, tuple[_Handles, int]] = {}
+        self._polls = 0
         self._started = False
 
     def observe(
         self,
         entries: Mapping[str, Identity],
-        events: Iterable[tuple[str, int]] = (),
+        events: Iterable[tuple[str, int] | tuple[str, int, int]] = (),
         *,
         events_reliable: bool = False,
     ) -> GateResult:
-        """`events` are the inotify (name, mask) pairs since the previous call,
-        oldest first."""
+        """`events` are the inotify (name, mask[, cookie]) tuples since the
+        previous call, oldest first."""
         now = self._clock()
         # Files present at the very first scan arrived while nobody watched.
         watching = events_reliable and self._started
@@ -152,37 +159,70 @@ class TransferGate:
         for name in list(self._seen):
             if name not in entries:
                 del self._seen[name]
+        # Dotfiles are not entries but their handles matter once renamed in;
+        # drop state for anything that is neither listed nor hidden.
+        for name in list(self._handles):
+            if name not in entries and not name.startswith("."):
+                del self._handles[name]
         for name, ident in entries.items():
             seen = self._seen.get(name)
             if seen is None or not seen.ident.same_file(ident):
                 self._seen[name] = _Seen(ident, now, now, needs_close=watching)
             elif seen.ident != ident:
-                seen.ident, seen.last_change, seen.closed = ident, now, False
+                seen.ident, seen.last_change = ident, now
+                # Written to since any close we saw (in case its event was lost).
+                if name in self._handles:
+                    self._handles[name].closed = False
         # Events are applied after the scan, in order: a close reported now
         # covers the state we just observed, while a later create, open or
         # write under the same name cancels it.
-        for name, mask in events:
-            if name in self._seen:
-                self._seen[name].apply(mask)
+        self._polls += 1
+        for event in events:
+            self._apply(*event)
+        self._moving = {c: v for c, v in self._moving.items() if v[1] >= self._polls - 1}
         ready, overdue = [], []
         for name, seen in self._seen.items():
             quiet = now - seen.last_change
             if not seen.ident.is_regular:
                 ready.append(name)  # quarantined on adoption; nothing to wait for
-            elif seen.opens:
+            handles = self._handles.get(name)
+            needs_close = handles.watched if handles else seen.needs_close
+            if handles and handles.opens:
                 pass  # someone still has it open
-            elif seen.closed and quiet >= self.stable_seconds:
+            elif handles and handles.closed and quiet >= self.stable_seconds:
                 ready.append(name)
-            elif not seen.needs_close and quiet >= self.fallback_stable_seconds:
+            elif not needs_close and quiet >= self.fallback_stable_seconds:
                 ready.append(name)
             if name not in ready and now - seen.first_seen >= self.max_wait_seconds:
                 overdue.append(name)
         return GateResult(sorted(ready), sorted(overdue))
 
+    def _apply(self, name: str, mask: int, cookie: int = 0) -> None:
+        if mask & IN_CREATE:
+            self._handles[name] = _Handles(watched=True)
+        elif mask & IN_DELETE:
+            self._handles.pop(name, None)
+        elif mask & IN_MOVED_FROM:
+            moved = self._handles.pop(name, None)
+            if moved is not None and cookie:
+                self._moving[cookie] = (moved, self._polls)
+        elif mask & IN_MOVED_TO:
+            moved = self._moving.pop(cookie, (None, 0))[0] if cookie else None
+            # Moved in from elsewhere: we never saw its handles, so it gets the
+            # stability fallback, not a close it may never send.
+            self._handles[name] = moved or _Handles(watched=False)
+        else:
+            if name not in self._handles:
+                seen = self._seen.get(name)
+                self._handles[name] = _Handles(watched=seen.needs_close if seen else False)
+            self._handles[name].apply(mask)
+
     def forget_closed(self) -> None:
         """After lost inotify events, fall back to the stability window."""
+        self._handles.clear()
+        self._moving.clear()
         for seen in self._seen.values():
-            seen.closed, seen.opens, seen.needs_close = False, 0, False
+            seen.needs_close = False
 
 
 # -- spool -------------------------------------------------------------------------
@@ -432,10 +472,11 @@ class Spool:
         resuming after a crash: the earlier process may have died before (or
         while) running its own fsyncs.
         """
-        try:
+        entry = fsutil.lstat_at(name, gen_fd)
+        if entry is not None and entry.is_regular:
+            # Errors propagate: the job stays resumable instead of committing
+            # over a file whose bytes may not be durable.
             fsutil.fsync_file(name, gen_fd)
-        except OSError:
-            pass  # not a regular file (quarantined); its directory entry is enough
         os.fsync(gen_fd)
         job_fd = fsutil.open_dir(doc_id, dir_fd=self.jobs_fd)
         try:
@@ -548,10 +589,10 @@ class Watcher:
 
     def poll_once(self) -> PollReport:
         report = PollReport()
-        events: list[tuple[str, int]] = []
+        events: list[tuple[str, int, int]] = []
         reliable = self.inotify is not None
         if self.inotify is not None:
-            events = [(os.fsdecode(n), mask) for n, mask in self.inotify.read()]
+            events = [(os.fsdecode(n), mask, c) for n, mask, c in self.inotify.read()]
             if self.inotify.overflowed:
                 # Events were lost: nothing seen this poll can rely on them.
                 self.gate.forget_closed()

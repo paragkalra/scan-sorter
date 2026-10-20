@@ -779,7 +779,7 @@ def test_inotify_reports_events_in_order(dirs, spool):
     try:
         write(inbox / "a.pdf")
         (inbox / "a.pdf").unlink()
-        masks = [m for n, m in ino.read() if n == b"a.pdf"]
+        masks = [m for n, m, _c in ino.read() if n == b"a.pdf"]
         assert masks[0] & IN_CREATE and masks[-1] & IN_DELETE
         assert any(m & IN_CLOSE_WRITE for m in masks)
     finally:
@@ -986,3 +986,75 @@ def test_orphan_with_only_an_unverified_input_is_quarantined(dirs, spool, store)
     assert spool.reconcile(store) == [doc_id]
     job = store.get(doc_id)
     assert (job.state, last_code(store, job)) == (State.QUARANTINED, "orphaned_input")
+
+
+def test_upload_renamed_into_place_while_still_open_is_not_adopted(dirs, spool, store, clock):
+    inbox, spool_dir = dirs
+    w = make_watcher(store, spool, clock)
+    if w.inotify is None:
+        pytest.skip("inotify unavailable")
+    w.poll_once()
+    with open(inbox / ".upload", "wb") as f:
+        f.write(b"page one")
+        f.flush()
+        os.rename(inbox / ".upload", inbox / "scan.pdf")
+        w.poll_once()
+        clock.t += 120
+        assert w.poll_once().adopted == []
+        f.write(b" page two")
+    w.poll_once()
+    clock.t += 10
+    [doc] = w.poll_once().adopted
+    assert original(spool_dir, doc).read_bytes() == b"page one page two"
+    w.close()
+
+
+def test_upload_closed_then_renamed_into_place_is_adopted_promptly(dirs, spool, store, clock):
+    inbox, _ = dirs
+    w = make_watcher(store, spool, clock)
+    if w.inotify is None:
+        pytest.skip("inotify unavailable")
+    w.poll_once()
+    write(inbox / ".upload", b"complete scan")
+    w.poll_once()
+    os.rename(inbox / ".upload", inbox / "scan.pdf")
+    w.poll_once()
+    clock.t += 10
+    assert len(w.poll_once().adopted) == 1
+    w.close()
+
+
+def test_file_moved_in_from_elsewhere_uses_the_fallback(dirs, spool, store, clock, tmp_path):
+    inbox, _ = dirs
+    w = make_watcher(store, spool, clock)
+    if w.inotify is None:
+        pytest.skip("inotify unavailable")
+    w.poll_once()
+    write(tmp_path / "outside.pdf")
+    os.rename(tmp_path / "outside.pdf", inbox / "scan.pdf")
+    w.poll_once()
+    clock.t += 59
+    assert w.poll_once().adopted == []
+    clock.t += 1
+    assert len(w.poll_once().adopted) == 1
+    w.close()
+
+
+def test_failed_file_fsync_keeps_the_job_resumable(dirs, spool, store, monkeypatch):
+    inbox, spool_dir = dirs
+    st = write(inbox / "slow.pdf", b"partial")
+    job = _registered(store, "slow.pdf", st, quarantine="incomplete_transfer")
+    g = gen_dir(spool_dir, job.doc_id)
+    g.mkdir(parents=True)
+    os.rename(inbox / "slow.pdf", g / INCOMING)
+
+    def eio(*a, **k):
+        raise OSError(5, "I/O error")
+
+    monkeypatch.setattr(ingest.fsutil, "fsync_file", eio)
+    with pytest.raises(OSError):
+        spool.reconcile(store)
+    assert store.get(job.doc_id).state is State.RECEIVED
+    monkeypatch.undo()
+    spool.reconcile(store)
+    assert store.get(job.doc_id).state is State.QUARANTINED

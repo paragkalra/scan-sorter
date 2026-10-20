@@ -59,9 +59,12 @@ class Inotify:
     def fileno(self) -> int:
         return self._fd
 
-    def read(self) -> list[tuple[bytes, int]]:
-        """(name, mask) for every event since the last read, oldest first."""
-        events: list[tuple[bytes, int]] = []
+    def read(self) -> list[tuple[bytes, int, int]]:
+        """(name, mask, cookie) for every event since the last read, oldest first.
+
+        The cookie pairs IN_MOVED_FROM with IN_MOVED_TO for a rename.
+        """
+        events: list[tuple[bytes, int, int]] = []
         while True:
             try:
                 buf = os.read(self._fd, 64 * 1024)
@@ -73,14 +76,14 @@ class Inotify:
                 raise
             pos = 0
             while pos < len(buf):
-                _wd, mask, _cookie, length = _HEADER.unpack_from(buf, pos)
+                _wd, mask, cookie, length = _HEADER.unpack_from(buf, pos)
                 pos += _HEADER.size
                 name = buf[pos : pos + length].rstrip(b"\0")
                 pos += length
                 if mask & IN_Q_OVERFLOW:
                     self.overflowed = True
                 elif name and mask & WATCH_MASK:
-                    events.append((name, mask & WATCH_MASK))
+                    events.append((name, mask & WATCH_MASK, cookie))
 
     def close(self) -> None:
         os.close(self._fd)
