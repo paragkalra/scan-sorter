@@ -2,6 +2,7 @@ import hashlib
 import multiprocessing
 import os
 import stat
+import threading
 from collections import namedtuple
 from pathlib import Path
 
@@ -9,11 +10,12 @@ import pytest
 
 from scan_sorter import fsutil, ingest
 from scan_sorter.fsutil import Identity
-from scan_sorter.ingest import ORIGINAL, Spool, TransferGate, Watcher
+from scan_sorter.ingest import INCOMING, ORIGINAL, Spool, TransferGate, Watcher
 from scan_sorter.jobs import FailureKind, JobStore, QueueFullError, Stage, State
 
 Usage = namedtuple("Usage", "total used free")
 PLENTY = lambda _p: Usage(0, 0, 1 << 40)  # noqa: E731
+NO_DISK = lambda _p: Usage(0, 0, 0)  # noqa: E731
 
 
 class Clock:
@@ -49,8 +51,20 @@ def write(path: Path, data: bytes = b"%PDF-1.7 scan") -> Identity:
     return Identity.of(os.lstat(path))
 
 
-def original(spool_dir: Path, doc_id: str) -> Path:
-    return spool_dir / "jobs" / doc_id / ORIGINAL
+def gen_dir(spool_dir: Path, doc_id: str, gen: int = 0) -> Path:
+    return spool_dir / "jobs" / doc_id / f"g{gen}"
+
+
+def original(spool_dir: Path, doc_id: str, gen: int = 0) -> Path:
+    return gen_dir(spool_dir, doc_id, gen) / ORIGINAL
+
+
+def sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def last_code(store, job):
+    return store.history(job.doc_id)[-1][2]
 
 
 # -- transfer gate --------------------------------------------------------------
@@ -66,19 +80,47 @@ def make_gate(clock):
     )
 
 
+def started_gate(clock):
+    """A gate past its first (startup) scan, watching with reliable events."""
+    gate = make_gate(clock)
+    gate.observe({}, events_reliable=True)
+    return gate
+
+
 def test_gate_closed_file_is_ready_after_stable_window():
     clock = Clock()
-    gate = make_gate(clock)
-    assert gate.observe({"a": ident()}, closed=["a"]).ready == []
+    gate = started_gate(clock)
+    assert gate.observe({"a": ident()}, ["a"], events_reliable=True).ready == []
     clock.t += 9
-    assert gate.observe({"a": ident()}).ready == []
+    assert gate.observe({"a": ident()}, events_reliable=True).ready == []
     clock.t += 1
-    assert gate.observe({"a": ident()}).ready == ["a"]
+    assert gate.observe({"a": ident()}, events_reliable=True).ready == ["a"]
 
 
-def test_gate_without_close_waits_for_fallback_window():
+def test_gate_watched_arrival_without_close_is_never_ready_only_overdue():
+    # A writer that pauses for minutes with the file open must not be adopted.
+    clock = Clock()
+    gate = started_gate(clock)
+    gate.observe({"a": ident()}, events_reliable=True)
+    clock.t += 599
+    result = gate.observe({"a": ident()}, events_reliable=True)
+    assert result.ready == [] and result.overdue == []
+    clock.t += 1
+    assert gate.observe({"a": ident()}, events_reliable=True).overdue == ["a"]
+
+
+def test_gate_files_present_at_startup_use_fallback_window():
     clock = Clock()
     gate = make_gate(clock)
+    gate.observe({"a": ident()}, events_reliable=True)
+    clock.t += 60
+    assert gate.observe({"a": ident()}, events_reliable=True).ready == ["a"]
+
+
+def test_gate_without_events_uses_fallback_window():
+    clock = Clock()
+    gate = make_gate(clock)
+    gate.observe({})
     gate.observe({"a": ident()})
     clock.t += 59
     assert gate.observe({"a": ident()}).ready == []
@@ -88,24 +130,15 @@ def test_gate_without_close_waits_for_fallback_window():
 
 def test_gate_change_restarts_the_window_and_clears_close():
     clock = Clock()
-    gate = make_gate(clock)
-    gate.observe({"a": ident(size=10)}, closed=["a"])
+    gate = started_gate(clock)
+    gate.observe({"a": ident(size=10)}, ["a"], events_reliable=True)
     clock.t += 9
-    gate.observe({"a": ident(size=20)})  # writer reopened and appended
-    clock.t += 5
-    assert gate.observe({"a": ident(size=20)}).ready == []
-    clock.t += 60
-    assert gate.observe({"a": ident(size=20)}).ready == ["a"]
-
-
-def test_gate_close_reported_with_a_change_counts_for_that_change():
-    clock = Clock()
-    gate = make_gate(clock)
-    gate.observe({"a": ident(size=10)})
-    clock.t += 1
-    gate.observe({"a": ident(size=20)}, closed=["a"])
+    gate.observe({"a": ident(size=20)}, events_reliable=True)  # reopened, appended
+    clock.t += 100
+    assert gate.observe({"a": ident(size=20)}, events_reliable=True).ready == []
+    gate.observe({"a": ident(size=20)}, ["a"], events_reliable=True)
     clock.t += 10
-    assert gate.observe({"a": ident(size=20)}).ready == ["a"]
+    assert gate.observe({"a": ident(size=20)}, events_reliable=True).ready == ["a"]
 
 
 def test_gate_replaced_file_starts_over():
@@ -113,7 +146,7 @@ def test_gate_replaced_file_starts_over():
     gate = make_gate(clock)
     gate.observe({"a": ident(ino=1)})
     clock.t += 590
-    gate.observe({"a": ident(ino=2, size=1)})  # same name, new file
+    gate.observe({"a": ident(ino=2, size=1)})
     clock.t += 20
     result = gate.observe({"a": ident(ino=2, size=2)})
     assert result.overdue == [] and result.ready == []
@@ -126,27 +159,29 @@ def test_gate_never_settling_file_is_overdue():
         result = gate.observe({"a": ident(size=i)})
         clock.t += 10
     assert result.overdue == ["a"]
-    assert result.ready == []
 
 
 def test_gate_non_regular_entries_are_ready_at_once():
-    gate = make_gate(Clock())
+    gate = started_gate(Clock())
     assert gate.observe({"l": ident(mode=stat.S_IFLNK | 0o777)}).ready == ["l"]
 
 
-def test_gate_forgets_vanished_names_and_close_marks():
+def test_gate_overflow_falls_back_to_stability_window():
     clock = Clock()
-    gate = make_gate(clock)
-    gate.observe({"a": ident()}, closed=["a"])
+    gate = started_gate(clock)
+    gate.observe({"a": ident()}, ["a"], events_reliable=True)
     gate.forget_closed()
     clock.t += 10
-    assert gate.observe({"a": ident()}).ready == []
-    gate.observe({})
+    assert gate.observe({"a": ident()}, events_reliable=True).ready == []
+    clock.t += 50
+    assert gate.observe({"a": ident()}, events_reliable=True).ready == ["a"]
+
+
+def test_gate_forgets_vanished_names_and_ignores_unknown_closes():
+    gate = started_gate(Clock())
+    gate.observe({"a": ident()})
+    assert gate.observe({}, ["ghost"]).ready == []
     assert gate._seen == {}
-
-
-def test_gate_ignores_close_for_unknown_names():
-    assert make_gate(Clock()).observe({}, closed=["ghost"]).ready == []
 
 
 # -- spool setup -----------------------------------------------------------------------
@@ -161,9 +196,13 @@ def test_spool_refuses_symlinked_directories(tmp_path):
         Spool(tmp_path / "inbox", tmp_path / "spool")
 
 
-def test_spool_dirs_are_private(dirs):
+def test_spool_dirs_are_private_and_jobs_entry_is_synced(dirs, monkeypatch):
     inbox, spool_dir = dirs
-    with Spool(inbox, spool_dir):
+    synced = []
+    real_fsync = os.fsync
+    monkeypatch.setattr(ingest.os, "fsync", lambda fd: (synced.append(fd), real_fsync(fd)))
+    with Spool(inbox, spool_dir) as s:
+        assert s.spool_fd in synced
         assert stat.S_IMODE(os.stat(spool_dir).st_mode) == 0o700
         assert stat.S_IMODE(os.stat(spool_dir / "jobs").st_mode) == 0o700
 
@@ -178,22 +217,98 @@ def test_spool_skips_dotfiles(dirs, spool):
 # -- adoption ------------------------------------------------------------------------
 
 
-def test_adopt_moves_file_and_records_hash_and_intake(dirs, spool, store):
+def test_adopt_makes_a_private_copy_and_records_hash_and_intake(dirs, spool, store):
     inbox, spool_dir = dirs
     data = b"%PDF-1.7 hello"
     st = write(inbox / "scan001.pdf", data)
     job = spool.adopt(store, "scan001.pdf", st)
-    assert job.state is State.RECEIVED
-    assert job.source_hash == hashlib.sha256(data).hexdigest()
-    assert job.source_name == "scan001.pdf"
-    assert not (inbox / "scan001.pdf").exists()
-    moved = original(spool_dir, job.doc_id)
-    assert moved.read_bytes() == data
-    assert Identity.of(os.lstat(moved)).same_file(st)
-    assert stat.S_IMODE(os.stat(moved.parent).st_mode) == 0o700
+    assert (job.state, job.source_hash, job.source_name) == (
+        State.RECEIVED,
+        sha(data),
+        "scan001.pdf",
+    )
+    assert os.listdir(inbox) == []
+    copy = original(spool_dir, job.doc_id)
+    assert copy.read_bytes() == data
+    copy_id = Identity.of(os.lstat(copy))
+    assert not copy_id.same_file(st)  # a new inode the printer never had
+    assert stat.S_IMODE(copy_id.mode) == 0o600
+    assert os.listdir(gen_dir(spool_dir, job.doc_id)) == [ORIGINAL]
+    assert stat.S_IMODE(os.stat(gen_dir(spool_dir, job.doc_id)).st_mode) == 0o700
     intake = store.stage_result(job.doc_id, Stage.INTAKE)
     assert bytes.fromhex(intake["inbox_name_hex"]) == b"scan001.pdf"
+    assert (intake["gen"], intake["quarantine"]) == (0, None)
     assert Identity.from_dict(intake) == st
+
+
+def test_writer_keeping_its_handle_cannot_change_the_adopted_copy(dirs, spool, store):
+    inbox, spool_dir = dirs
+    write(inbox / "scan.pdf", b"original bytes")
+    handle = open(inbox / "scan.pdf", "r+b")  # noqa: SIM115
+    try:
+        job = spool.adopt(store, "scan.pdf", spool.inbox_entries()["scan.pdf"])
+        handle.seek(0)
+        handle.write(b"TAMPERED")
+        handle.flush()
+    finally:
+        handle.close()
+    assert original(spool_dir, job.doc_id).read_bytes() == b"original bytes"
+    assert store.get(job.doc_id).source_hash == sha(b"original bytes")
+
+
+def test_hardlinked_input_is_quarantined(dirs, spool, store):
+    inbox, _ = dirs
+    write(inbox / "scan.pdf")
+    os.link(inbox / "scan.pdf", inbox / "alias.pdf")
+    job = spool.adopt(store, "scan.pdf", spool.inbox_entries()["scan.pdf"])
+    assert (job.state, last_code(store, job)) == (State.QUARANTINED, "multiple_links")
+
+
+def test_source_changing_during_the_copy_is_quarantined(dirs, spool, store, monkeypatch):
+    inbox, spool_dir = dirs
+    write(inbox / "scan.pdf", b"part one")
+    real_pread = os.pread
+
+    appended = []
+
+    def pread_while_writer_appends(fd, n, off):
+        data = real_pread(fd, n, off)
+        if data and not appended:
+            appended.append(True)
+            appender = os.open(f"/proc/self/fd/{fd}", os.O_WRONLY | os.O_APPEND)
+            os.write(appender, b" more")
+            os.close(appender)
+        return data
+
+    monkeypatch.setattr(fsutil.os, "pread", pread_while_writer_appends)
+    job = spool.adopt(store, "scan.pdf", spool.inbox_entries()["scan.pdf"])
+    assert (job.state, last_code(store, job)) == (State.QUARANTINED, "changed_during_adoption")
+    assert ORIGINAL not in os.listdir(gen_dir(spool_dir, job.doc_id))
+
+
+def test_private_copy_reports_a_reset_mtime_as_a_change(tmp_path, monkeypatch):
+    src = tmp_path / "src"
+    src.write_bytes(b"abc")
+    st = os.stat(src)
+    real_pread = os.pread
+
+    def pread_then_tamper(f, n, off):
+        data = real_pread(f, n, off)
+        if data:
+            with open(src, "r+b") as w:
+                w.write(b"xyz")
+            os.utime(src, ns=(st.st_atime_ns, st.st_mtime_ns))  # client resets mtime
+        return data
+
+    fd = os.open(src, os.O_RDONLY)
+    dir_fd = os.open(tmp_path, os.O_RDONLY)
+    try:
+        monkeypatch.setattr(fsutil.os, "pread", pread_then_tamper)
+        _, stable = fsutil.private_copy(fd, "dst", dir_fd)
+    finally:
+        os.close(fd)
+        os.close(dir_fd)
+    assert not stable
 
 
 def test_adopt_symlink_is_quarantined_and_target_untouched(dirs, spool, store, tmp_path):
@@ -202,10 +317,9 @@ def test_adopt_symlink_is_quarantined_and_target_untouched(dirs, spool, store, t
     secret.write_text("private")
     (inbox / "evil.pdf").symlink_to(secret)
     job = spool.adopt(store, "evil.pdf", fsutil.lstat_at("evil.pdf", spool.inbox_fd))
-    assert job.state is State.QUARANTINED
-    assert store.history(job.doc_id)[-1][2] == "not_regular_file"
+    assert (job.state, last_code(store, job)) == (State.QUARANTINED, "not_regular_file")
     assert secret.read_text() == "private"
-    assert original(spool_dir, job.doc_id).is_symlink()
+    assert (gen_dir(spool_dir, job.doc_id) / INCOMING).is_symlink()
 
 
 def test_adopt_fifo_is_quarantined_without_blocking(dirs, spool, store):
@@ -234,33 +348,17 @@ def test_adopt_refuses_a_file_that_changed_after_the_gate(dirs, spool, store):
     assert store.jobs_in(*State) == []
 
 
-def test_adopt_quarantines_a_file_written_to_during_the_rename(dirs, spool, store, monkeypatch):
-    inbox, spool_dir = dirs
-    st = write(inbox / "scan.pdf", b"part")
-    real_rename = os.rename
-
-    def rename_then_writer_appends(src, dst, **kw):
-        real_rename(src, dst, **kw)
-        with open(spool_dir / "jobs" / os.listdir(spool_dir / "jobs")[0] / ORIGINAL, "ab") as f:
-            f.write(b"late bytes from an open handle")
-
-    monkeypatch.setattr(ingest.os, "rename", rename_then_writer_appends)
-    job = spool.adopt(store, "scan.pdf", st)
-    assert job.state is State.QUARANTINED
-    assert store.history(job.doc_id)[-1][2] == "changed_during_adoption"
-
-
-def test_adopt_fails_when_the_file_vanished(dirs, spool, store):
+def test_source_deleted_at_the_rename_fails_the_job_cleanly(dirs, spool, store, monkeypatch):
     inbox, _ = dirs
     st = write(inbox / "scan.pdf")
-    real_create = store.create
+    real_rename = os.rename
 
-    def create_then_vanish(*a, **k):
-        job = real_create(*a, **k)
-        (inbox / "scan.pdf").unlink()
-        return job
+    def delete_first(src, dst, **kw):
+        if dst == INCOMING:
+            (inbox / "scan.pdf").unlink()
+        return real_rename(src, dst, **kw)
 
-    store.create = create_then_vanish
+    monkeypatch.setattr(ingest.os, "rename", delete_first)
     job = spool.adopt(store, "scan.pdf", st)
     assert (job.state, job.failure_kind, job.failure_code) == (
         State.FAILED,
@@ -280,7 +378,7 @@ def test_adopt_queue_full_leaves_file_in_inbox(dirs, tmp_path):
 
 
 def test_non_utf8_filename_round_trips(dirs, spool, store):
-    inbox, spool_dir = dirs
+    inbox, _ = dirs
     raw = b"scan\xff\x01.pdf"
     fd = os.open(os.fsencode(inbox) + b"/" + raw, os.O_WRONLY | os.O_CREAT, 0o600)
     os.write(fd, b"data")
@@ -295,36 +393,71 @@ def test_non_utf8_filename_round_trips(dirs, spool, store):
 # -- reconcile ---------------------------------------------------------------------------
 
 
-def _registered_but_not_moved(spool, store, name, st):
-    intake = {"inbox_name_hex": os.fsencode(name).hex(), **st.as_dict()}
-    return store.create(name, intake=intake)
+def _registered(store, name, st, *, gen=0, quarantine=None):
+    return store.create(name, intake=ingest._intake(name, st, gen, quarantine))
 
 
 def test_reconcile_finishes_an_adoption_cut_before_the_rename(dirs, spool, store):
     inbox, spool_dir = dirs
     st = write(inbox / "scan.pdf", b"abc")
-    job = _registered_but_not_moved(spool, store, "scan.pdf", st)
+    job = _registered(store, "scan.pdf", st)
     assert spool.reconcile(store) == [job.doc_id]
-    job = store.get(job.doc_id)
-    assert job.source_hash == hashlib.sha256(b"abc").hexdigest()
+    assert store.get(job.doc_id).source_hash == sha(b"abc")
     assert original(spool_dir, job.doc_id).read_bytes() == b"abc"
     assert os.listdir(inbox) == []
 
 
-def test_reconcile_records_hash_when_cut_after_the_rename(dirs, spool, store):
+def test_reconcile_finishes_an_adoption_cut_after_the_rename(dirs, spool, store):
     inbox, spool_dir = dirs
     st = write(inbox / "scan.pdf", b"abc")
-    job = _registered_but_not_moved(spool, store, "scan.pdf", st)
-    (spool_dir / "jobs" / job.doc_id).mkdir()
-    os.rename(inbox / "scan.pdf", original(spool_dir, job.doc_id))
+    job = _registered(store, "scan.pdf", st)
+    gen_dir(spool_dir, job.doc_id).mkdir(parents=True)
+    os.rename(inbox / "scan.pdf", gen_dir(spool_dir, job.doc_id) / INCOMING)
     spool.reconcile(store)
-    assert store.get(job.doc_id).source_hash == hashlib.sha256(b"abc").hexdigest()
+    assert store.get(job.doc_id).source_hash == sha(b"abc")
+    assert os.listdir(gen_dir(spool_dir, job.doc_id)) == [ORIGINAL]
+
+
+def test_reconcile_keeps_quarantine_intent(dirs, spool, store):
+    inbox, _ = dirs
+    st = write(inbox / "slow.pdf", b"half a scan")
+    job = _registered(store, "slow.pdf", st, quarantine="incomplete_transfer")
+    spool.reconcile(store)
+    job = store.get(job.doc_id)
+    assert (job.state, job.source_hash) == (State.QUARANTINED, None)
+    assert last_code(store, job) == "incomplete_transfer"
+
+
+def test_recovery_redoes_durability_barriers_before_the_hash(dirs, spool, store, monkeypatch):
+    inbox, spool_dir = dirs
+    st = write(inbox / "scan.pdf", b"abc")
+    job = _registered(store, "scan.pdf", st)
+    g = gen_dir(spool_dir, job.doc_id)
+    g.mkdir(parents=True)
+    os.rename(inbox / "scan.pdf", g / INCOMING)
+    events = []
+    real_fsync, real_set = os.fsync, store.set_source_hash
+
+    def fsync(fd):
+        events.append(os.readlink(f"/proc/self/fd/{fd}"))
+        real_fsync(fd)
+
+    def set_source_hash(*a, **k):
+        events.append("HASH")
+        return real_set(*a, **k)
+
+    monkeypatch.setattr(ingest.os, "fsync", fsync)
+    store.set_source_hash = set_source_hash
+    spool.reconcile(store)
+    before_hash = events[: events.index("HASH")]
+    for needed in (str(g / ORIGINAL), str(g), str(spool_dir / "jobs"), str(inbox)):
+        assert needed in before_hash, needed
 
 
 def test_reconcile_does_not_take_a_different_file_with_the_same_name(dirs, spool, store):
     inbox, _ = dirs
     st = write(inbox / "scan.pdf", b"first")
-    job = _registered_but_not_moved(spool, store, "scan.pdf", st)
+    job = _registered(store, "scan.pdf", st)
     (inbox / "scan.pdf").unlink()
     write(inbox / "scan.pdf", b"second scan, same name")
     spool.reconcile(store)
@@ -332,33 +465,34 @@ def test_reconcile_does_not_take_a_different_file_with_the_same_name(dirs, spool
     assert (inbox / "scan.pdf").read_bytes() == b"second scan, same name"
 
 
-def test_reconcile_fails_jobs_whose_file_is_gone(dirs, spool, store):
-    inbox, _ = dirs
-    st = write(inbox / "scan.pdf")
-    job = _registered_but_not_moved(spool, store, "scan.pdf", st)
-    (inbox / "scan.pdf").unlink()
+def test_reconcile_moves_a_replacement_into_its_own_generation(dirs, spool, store):
+    inbox, spool_dir = dirs
+    old = spool.adopt(store, "scan.pdf", write(inbox / "scan.pdf", b"old, unreadable"))
+    old = store.advance(old, State.QUARANTINED, code="corrupt")
+    st = write(inbox / "rescan.pdf", b"new and good")
+    store.replace(old, "rescan.pdf", intake=ingest._intake("rescan.pdf", st, 1, None))
     spool.reconcile(store)
-    assert store.get(job.doc_id).state is State.FAILED
+    job = store.get(old.doc_id)
+    assert job.source_hash == sha(b"new and good")
+    assert original(spool_dir, job.doc_id, 1).read_bytes() == b"new and good"
+    assert original(spool_dir, job.doc_id, 0).read_bytes() == b"old, unreadable"
 
 
 def test_reconcile_adopts_spool_dirs_without_a_row(dirs, spool, store):
     _, spool_dir = dirs
     doc_id = "ab" * 16
-    (spool_dir / "jobs" / doc_id).mkdir()
+    gen_dir(spool_dir, doc_id).mkdir(parents=True)
     original(spool_dir, doc_id).write_bytes(b"orphan")
     assert spool.reconcile(store) == [doc_id]
     job = store.get(doc_id)
-    assert (job.source_name, job.source_hash) == (
-        "recovered",
-        hashlib.sha256(b"orphan").hexdigest(),
-    )
+    assert (job.source_name, job.source_hash) == ("recovered", sha(b"orphan"))
 
 
 def test_reconcile_removes_empty_orphan_dirs_and_ignores_junk(dirs, spool, store):
     _, spool_dir = dirs
     (spool_dir / "jobs" / ("cd" * 16)).mkdir()
-    (spool_dir / "jobs" / "not-a-job").mkdir()
-    (spool_dir / "jobs" / "not-a-job" / ORIGINAL).write_bytes(b"x")
+    (spool_dir / "jobs" / "not-a-job" / "g0").mkdir(parents=True)
+    (spool_dir / "jobs" / "not-a-job" / "g0" / ORIGINAL).write_bytes(b"x")
     (spool_dir / "jobs" / "stray-file").write_bytes(b"x")
     assert spool.reconcile(store) == []
     assert sorted(os.listdir(spool_dir / "jobs")) == ["not-a-job", "stray-file"]
@@ -376,7 +510,7 @@ def test_recovered_orphans_ignore_queue_capacity(dirs, tmp_path):
     inbox, spool_dir = dirs
     doc_id = "ef" * 16
     with Spool(inbox, spool_dir) as spool, JobStore(tmp_path / "q.sqlite", max_active=0) as store:
-        (spool_dir / "jobs" / doc_id).mkdir()
+        gen_dir(spool_dir, doc_id).mkdir(parents=True)
         original(spool_dir, doc_id).write_bytes(b"x")
         spool.reconcile(store)
         assert store.get(doc_id).state is State.RECEIVED
@@ -389,36 +523,48 @@ def test_recovered_orphans_ignore_queue_capacity(dirs, tmp_path):
 CRASHED = 77
 
 
-def _crash_during_adopt(inbox, spool_dir, db_path, point):
-    real_rename, real_fsync, real_hash = os.rename, os.fsync, fsutil.sha256_file
+def _crash_during_adopt(inbox, spool_dir, db_path, point, quarantine):
+    real_rename = os.rename
+    renames = []
 
     def die():
         os._exit(CRASHED)
 
-    if point == "before_rename":
-        ingest.os.rename = lambda *a, **k: die()
-    elif point == "after_rename":
-
-        def rename(*a, **k):
-            real_rename(*a, **k)
+    def rename(*a, **k):
+        renames.append(a)
+        if point == "before_move" and len(renames) == 1:
+            die()
+        if point == "before_publish_copy" and len(renames) == 2:
+            die()
+        real_rename(*a, **k)
+        if point == "after_move" and len(renames) == 1:
             die()
 
-        ingest.os.rename = rename
-    elif point == "before_hash":
+    ingest.os.rename = rename
+    if point == "during_copy":
+        ingest.fsutil.private_copy = lambda *a, **k: die()
+    if point == "before_hash":
         ingest.fsutil.sha256_file = lambda *a, **k: die()
     with Spool(inbox, spool_dir) as spool, JobStore(db_path) as store:
-        spool.adopt(store, "scan.pdf", spool.inbox_entries()["scan.pdf"])
-    os.rename, os.fsync, fsutil.sha256_file = real_rename, real_fsync, real_hash
+        spool.adopt(
+            store,
+            "scan.pdf",
+            spool.inbox_entries()["scan.pdf"],
+            quarantine_code=quarantine,
+            ignore_capacity=True,
+        )
     os._exit(3)
 
 
-@pytest.mark.parametrize("point", ["before_rename", "after_rename", "before_hash"])
-def test_crash_during_adoption_is_recovered(dirs, tmp_path, point):
+POINTS = ["before_move", "after_move", "during_copy", "before_publish_copy", "before_hash"]
+
+
+def _crash_and_recover(dirs, tmp_path, point, quarantine=None):
     inbox, spool_dir = dirs
     db_path = tmp_path / "jobs.sqlite"
     write(inbox / "scan.pdf", b"precious")
     proc = multiprocessing.get_context("fork").Process(
-        target=_crash_during_adopt, args=(inbox, spool_dir, db_path, point)
+        target=_crash_during_adopt, args=(inbox, spool_dir, db_path, point, quarantine)
     )
     proc.start()
     proc.join(30)
@@ -427,13 +573,23 @@ def test_crash_during_adoption_is_recovered(dirs, tmp_path, point):
         spool.reconcile(store)
         jobs = store.jobs_in(*State)
         assert len(jobs) == 1
-        job = jobs[0]
-        assert (job.state, job.source_hash) == (
-            State.RECEIVED,
-            hashlib.sha256(b"precious").hexdigest(),
-        )
-        assert original(spool_dir, job.doc_id).read_bytes() == b"precious"
         assert os.listdir(inbox) == []
+        return store.history(jobs[0].doc_id), jobs[0]
+
+
+@pytest.mark.parametrize("point", POINTS)
+def test_crash_during_adoption_is_recovered(dirs, tmp_path, point):
+    _, job = _crash_and_recover(dirs, tmp_path, point)
+    assert (job.state, job.source_hash) == (State.RECEIVED, sha(b"precious"))
+    assert original(dirs[1], job.doc_id).read_bytes() == b"precious"
+    assert os.listdir(gen_dir(dirs[1], job.doc_id)) == [ORIGINAL]
+
+
+@pytest.mark.parametrize("point", ["before_move", "after_move"])
+def test_crash_during_overdue_adoption_still_quarantines(dirs, tmp_path, point):
+    history, job = _crash_and_recover(dirs, tmp_path, point, quarantine="incomplete_transfer")
+    assert job.state is State.QUARANTINED
+    assert history[-1][2] == "incomplete_transfer"
 
 
 # -- watcher -----------------------------------------------------------------------------
@@ -445,11 +601,8 @@ def clock():
 
 
 def make_watcher(store, spool, clock, **kw):
-    gate = TransferGate(
-        stable_seconds=10, fallback_stable_seconds=60, max_wait_seconds=600, clock=clock
-    )
     kw.setdefault("disk_usage", PLENTY)
-    return Watcher(store, spool, gate, min_free_bytes=1, **kw)
+    return Watcher(store, spool, make_gate(clock), min_free_bytes=1, **kw)
 
 
 def test_watcher_adopts_a_closed_file_after_the_stable_window(dirs, spool, store, clock):
@@ -457,12 +610,31 @@ def test_watcher_adopts_a_closed_file_after_the_stable_window(dirs, spool, store
     w = make_watcher(store, spool, clock)
     if w.inotify is None:
         pytest.skip("inotify unavailable")
+    w.poll_once()  # startup scan
     write(inbox / "scan.pdf")
     assert w.poll_once().adopted == []
     clock.t += 10
-    report = w.poll_once()
-    assert len(report.adopted) == 1
+    assert len(w.poll_once().adopted) == 1
     assert os.listdir(inbox) == []
+    w.close()
+
+
+def test_watcher_does_not_adopt_a_file_held_open_by_its_writer(dirs, spool, store, clock):
+    inbox, _ = dirs
+    w = make_watcher(store, spool, clock)
+    if w.inotify is None:
+        pytest.skip("inotify unavailable")
+    w.poll_once()
+    with open(inbox / "scan.pdf", "wb") as f:
+        f.write(b"first pages")
+        f.flush()
+        w.poll_once()
+        clock.t += 120  # writer pauses for two minutes, file still open
+        assert w.poll_once().adopted == []
+        f.write(b" last page")
+    w.poll_once()
+    clock.t += 10
+    assert len(w.poll_once().adopted) == 1
     w.close()
 
 
@@ -479,13 +651,24 @@ def test_watcher_without_inotify_uses_fallback_window(dirs, spool, store, clock)
 
 def test_watcher_pauses_on_low_disk_and_leaves_files(dirs, spool, store, clock):
     inbox, _ = dirs
-    w = make_watcher(store, spool, clock, use_inotify=False, disk_usage=lambda _p: Usage(0, 0, 0))
+    w = make_watcher(store, spool, clock, use_inotify=False, disk_usage=NO_DISK)
     write(inbox / "scan.pdf")
     w.poll_once()
     clock.t += 60
     report = w.poll_once()
     assert (report.adopted, report.paused) == ([], "disk_low")
     assert os.listdir(inbox) == ["scan.pdf"]
+
+
+def test_watcher_pauses_overdue_adoption_on_low_disk(dirs, spool, store, clock):
+    inbox, _ = dirs
+    w = make_watcher(store, spool, clock, use_inotify=False, disk_usage=NO_DISK)
+    for i in range(70):
+        write(inbox / "slow.pdf", b"x" * (i + 1))
+        report = w.poll_once()
+        clock.t += 10
+    assert (report.quarantined, report.paused) == ([], "disk_low")
+    assert os.listdir(inbox) == ["slow.pdf"]
 
 
 def test_watcher_pauses_on_full_queue_and_resumes(dirs, tmp_path, clock):
@@ -514,9 +697,43 @@ def test_watcher_quarantines_overdue_files_even_when_full(dirs, tmp_path, clock)
             if report.quarantined:
                 break
         assert len(report.quarantined) == 1
-        job = store.get(report.quarantined[0])
-        assert store.history(job.doc_id)[-1][2] == "incomplete_transfer"
+        assert last_code(store, store.get(report.quarantined[0])) == "incomplete_transfer"
         assert os.listdir(inbox) == []
+
+
+def test_overdue_file_growing_during_registration_is_still_quarantined(dirs, spool, store):
+    inbox, _ = dirs
+    st = write(inbox / "slow.pdf", b"x")
+    real_create = store.create
+
+    def create_while_writer_appends(*a, **k):
+        with open(inbox / "slow.pdf", "ab") as f:
+            f.write(b"more")
+        return real_create(*a, **k)
+
+    store.create = create_while_writer_appends
+    job = spool.adopt(store, "slow.pdf", st, quarantine_code="incomplete_transfer")
+    assert job.state is State.QUARANTINED
+
+
+def test_watcher_keeps_going_after_one_entry_errors(dirs, spool, store, clock, monkeypatch):
+    inbox, _ = dirs
+    w = make_watcher(store, spool, clock, use_inotify=False)
+    write(inbox / "a.pdf")
+    write(inbox / "b.pdf")
+    w.poll_once()
+    clock.t += 60
+    real_adopt = spool.adopt
+
+    def adopt(store, name, *a, **k):
+        if name == "a.pdf":
+            raise PermissionError(13, "denied")
+        return real_adopt(store, name, *a, **k)
+
+    monkeypatch.setattr(spool, "adopt", adopt)
+    report = w.poll_once()
+    assert len(report.adopted) == 1
+    assert os.listdir(inbox) == ["a.pdf"]
 
 
 def test_watcher_quarantines_symlinks_immediately(dirs, spool, store, clock, tmp_path):
@@ -527,27 +744,9 @@ def test_watcher_quarantines_symlinks_immediately(dirs, spool, store, clock, tmp
     assert len(report.quarantined) == 1
 
 
-def test_inotify_overflow_drops_close_marks(dirs, spool, store, clock):
-    inbox, _ = dirs
-    w = make_watcher(store, spool, clock)
-    if w.inotify is None:
-        pytest.skip("inotify unavailable")
-    write(inbox / "scan.pdf")
-    w.inotify.overflowed = True
-    w.poll_once()
-    clock.t += 10
-    assert w.poll_once().adopted == []  # no trusted close: wait for the fallback
-    clock.t += 50
-    assert len(w.poll_once().adopted) == 1
-    w.close()
-
-
 def test_run_reconciles_first_and_stops(dirs, spool, store, clock):
-    import threading
-
     inbox, _ = dirs
-    st = write(inbox / "scan.pdf")
-    job = _registered_but_not_moved(spool, store, "scan.pdf", st)
+    job = _registered(store, "scan.pdf", write(inbox / "scan.pdf"))
     stop = threading.Event()
     stop.set()
     make_watcher(store, spool, clock, use_inotify=False).run(stop, interval=0)

@@ -49,10 +49,11 @@ class Identity:
     size: int
     mtime_ns: int
     mode: int
+    nlink: int = 1
 
     @classmethod
     def of(cls, st: os.stat_result) -> Identity:
-        return cls(st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_mode)
+        return cls(st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_mode, st.st_nlink)
 
     @property
     def is_regular(self) -> bool:
@@ -61,6 +62,13 @@ class Identity:
     def same_file(self, other: Identity) -> bool:
         return (self.dev, self.ino) == (other.dev, other.ino)
 
+    def same_content(self, other: Identity) -> bool:
+        """Same file, not written to since (link count and permissions aside)."""
+        return self.same_file(other) and (self.size, self.mtime_ns) == (
+            other.size,
+            other.mtime_ns,
+        )
+
     def as_dict(self) -> dict[str, int]:
         return {
             "dev": self.dev,
@@ -68,11 +76,12 @@ class Identity:
             "size": self.size,
             "mtime_ns": self.mtime_ns,
             "mode": self.mode,
+            "nlink": self.nlink,
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> Identity:
-        return cls(d["dev"], d["ino"], d["size"], d["mtime_ns"], d["mode"])
+        return cls(d["dev"], d["ino"], d["size"], d["mtime_ns"], d["mode"], d.get("nlink", 1))
 
 
 def lstat_at(name: str | bytes, dir_fd: int) -> Identity | None:
@@ -106,6 +115,39 @@ def fsync_file(name: str | bytes, dir_fd: int) -> Identity:
         return Identity.of(os.fstat(fd))
     finally:
         os.close(fd)
+
+
+def private_copy(
+    src_fd: int, dst_name: str, dir_fd: int, *, chunk: int = 1 << 20
+) -> tuple[str, bool]:
+    """Copy an open file into a new 0600 file we alone own, hashing as we go.
+
+    Returns (sha256 of the copied bytes, whether the source stayed unchanged
+    during the copy). ctime is part of the check because a client can reset
+    mtime but not ctime. The hash always describes the copy, which nobody
+    else can open or link to.
+    """
+
+    def snapshot() -> tuple[int, int, int]:
+        st = os.fstat(src_fd)
+        return st.st_size, st.st_mtime_ns, st.st_ctime_ns
+
+    before = snapshot()
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+    dst = os.open(dst_name, flags, 0o600, dir_fd=dir_fd)
+    try:
+        h = hashlib.sha256()
+        offset = 0
+        while block := os.pread(src_fd, chunk, offset):
+            h.update(block)
+            view = memoryview(block)
+            while view:
+                view = view[os.write(dst, view) :]
+            offset += len(block)
+        os.fsync(dst)
+    finally:
+        os.close(dst)
+    return h.hexdigest(), snapshot() == before and offset == before[0]
 
 
 def sha256_file(name: str | bytes, dir_fd: int, *, chunk: int = 1 << 20) -> str:
