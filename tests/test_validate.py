@@ -655,3 +655,28 @@ def test_sandbox_child_can_still_signal_itself():
         "os.kill(os.getpid(), signal.SIGUSR1); signal.raise_signal(signal.SIGUSR1)"
     )
     assert sandbox.run([sys.executable, "-c", code]).returncode == 0
+
+
+def test_sandbox_child_cannot_change_other_processes_limits_or_priority():
+    import resource
+    import subprocess
+
+    victim = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])  # noqa: S603
+    try:
+        before = resource.prlimit(victim.pid, resource.RLIMIT_NOFILE)
+        for call in (
+            f"resource.prlimit({victim.pid}, resource.RLIMIT_NOFILE, (0, 0))",
+            f"os.setpriority(os.PRIO_PROCESS, {victim.pid}, 19)",
+            f"os.sched_setaffinity({victim.pid}, {{0}})",
+        ):
+            code = f"import os, resource; {call}"
+            assert sandbox.run([sys.executable, "-c", code]).returncode != 0, call
+        assert resource.prlimit(victim.pid, resource.RLIMIT_NOFILE) == before
+    finally:
+        victim.kill()
+        victim.wait()
+
+
+def test_sandbox_child_can_still_adjust_its_own_limits():
+    code = "import resource; resource.setrlimit(resource.RLIMIT_CORE, (0, 0))"
+    assert sandbox.run([sys.executable, "-c", code]).returncode == 0

@@ -3,9 +3,10 @@
 Landlock stops a parser from writing, truncating, creating or deleting
 files, but not from changing permissions, ownership, timestamps or extended
 attributes of files it can reach, and (before Landlock ABI 6) not from
-signalling other processes of the same user. This filter makes those system
-calls, and io_uring (which can do the same asynchronously), fail with EPERM;
-signals are allowed only to the parser itself or its own process group.
+signalling or re-limiting other processes of the same user. This filter
+makes those system calls, and io_uring (which can do the same
+asynchronously), fail with EPERM; signals and prlimit are allowed only on the
+parser itself (or, for kill, its own process group).
 Everything else is allowed: the filter only removes abilities a parser never
 needs.
 """
@@ -62,6 +63,17 @@ _ARCHES = {
             "utimensat": 280,
             "tkill": 200,  # thread id cannot be checked against our own
             "pidfd_send_signal": 424,
+            # Cross-process scheduling and memory controls (same-UID targets).
+            "setpriority": 141,
+            "ioprio_set": 251,
+            "sched_setaffinity": 203,
+            "sched_setattr": 314,
+            "sched_setparam": 142,
+            "sched_setscheduler": 144,
+            "migrate_pages": 256,
+            "move_pages": 279,
+            "process_madvise": 440,
+            "process_mrelease": 448,
             # io_uring can perform the calls above (e.g. IORING_OP_SETXATTR)
             # without entering them; parsers never need it.
             "io_uring_setup": 425,
@@ -88,6 +100,16 @@ _ARCHES = {
             "utimensat": 88,
             "tkill": 130,
             "pidfd_send_signal": 424,
+            "setpriority": 140,
+            "ioprio_set": 30,
+            "sched_setaffinity": 122,
+            "sched_setattr": 274,
+            "sched_setparam": 118,
+            "sched_setscheduler": 119,
+            "migrate_pages": 238,
+            "move_pages": 239,
+            "process_madvise": 440,
+            "process_mrelease": 448,
             # io_uring can perform the calls above (e.g. IORING_OP_SETXATTR)
             # without entering them; parsers never need it.
             "io_uring_setup": 425,
@@ -104,6 +126,9 @@ _SIGNAL_TARGETED = {
     "x86_64": {"kill": 62, "tgkill": 234, "rt_sigqueueinfo": 129, "rt_tgsigqueueinfo": 297},
     "aarch64": {"kill": 129, "tgkill": 131, "rt_sigqueueinfo": 138, "rt_tgsigqueueinfo": 240},
 }
+# prlimit64(pid, ...): 0 or our own PID only (rlimits of other same-UID
+# processes could otherwise be cut to zero).
+_PRLIMIT = {"x86_64": 302, "aarch64": 261}
 _OFF_ARG0_LOW = 16  # seccomp_data.args[0], low 32 bits (little endian)
 
 
@@ -134,6 +159,7 @@ def program(pid: int) -> bytes:
     prog.append((_BPF_JEQ_K, "check_kill", 0, signals["kill"]))
     for name in ("tgkill", "rt_sigqueueinfo", "rt_tgsigqueueinfo"):
         prog.append((_BPF_JEQ_K, "check_self", 0, signals[name]))
+    prog.append((_BPF_JEQ_K, "check_self_or_zero", 0, _PRLIMIT[machine]))
     # Classic BPF only jumps forward: the shared returns come last.
     prog.append((_BPF_RET_K, 0, 0, _RET_ALLOW))  # every other syscall
     labels = {"check_kill": len(prog)}  # kill(pid): self, own group (0 or -pid)
@@ -146,6 +172,12 @@ def program(pid: int) -> bytes:
     labels["check_self"] = len(prog)  # tgkill & co: thread group must be us
     prog += [
         (_BPF_LD_W_ABS, 0, 0, _OFF_ARG0_LOW),
+        (_BPF_JEQ_K, "allow", "deny", me),
+    ]
+    labels["check_self_or_zero"] = len(prog)  # prlimit64: self (0 or our PID)
+    prog += [
+        (_BPF_LD_W_ABS, 0, 0, _OFF_ARG0_LOW),
+        (_BPF_JEQ_K, "allow", 0, 0),
         (_BPF_JEQ_K, "allow", "deny", me),
     ]
     labels["allow"] = len(prog)
