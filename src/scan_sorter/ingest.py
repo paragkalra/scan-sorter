@@ -470,6 +470,12 @@ class Spool:
                 # the inbox durably.
                 os.fsync(fd)
                 self._move_to_incoming(name, gen_fd)
+                moved = fsutil.lstat_at(INCOMING, gen_fd)
+                if moved is None or not moved.same_file(Identity.of(os.fstat(fd))):
+                    # The name was pointed at another file between our open and
+                    # the rename: we moved that one. Keep it (never delete an
+                    # input we did not copy) and let a person look.
+                    return job, "changed_during_adoption"
                 return job, self._copy(fd, gen_fd, expected, lease)
         finally:
             os.close(fd)

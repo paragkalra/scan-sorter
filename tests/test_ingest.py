@@ -1211,3 +1211,22 @@ def test_writer_arriving_during_the_copy_quarantines_without_killing_us(
     assert children[0].wait(timeout=30) == 0  # released, the writer got through
     assert (job.state, last_code(store, job)) == (State.QUARANTINED, "writer_during_adoption")
     assert ORIGINAL not in os.listdir(gen_dir(spool_dir, job.doc_id))
+
+
+def test_name_swapped_to_another_file_before_the_move_loses_nothing(
+    dirs, spool, store, monkeypatch
+):
+    inbox, spool_dir = dirs
+    write(inbox / "scan.pdf", b"old scan")
+    real_rename = os.rename
+
+    def swap_then_rename(src, dst, **kw):
+        if dst == INCOMING:
+            write(inbox / ".new", b"NEW SCAN")
+            real_rename(inbox / ".new", inbox / "scan.pdf")  # atomic replace
+        return real_rename(src, dst, **kw)
+
+    monkeypatch.setattr(ingest.os, "rename", swap_then_rename)
+    job = spool.adopt(store, "scan.pdf", spool.inbox_entries()["scan.pdf"])
+    assert (job.state, last_code(store, job)) == (State.QUARANTINED, "changed_during_adoption")
+    assert (gen_dir(spool_dir, job.doc_id) / INCOMING).read_bytes() == b"NEW SCAN"
