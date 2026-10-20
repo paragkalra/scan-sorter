@@ -615,3 +615,43 @@ def test_mark_validated_refuses_a_non_canonical_job(env, tmp_path):
         store.mark_validated(newer, {}, skip_filed=True)
     assert exc.value.canonical.doc_id == older.doc_id
     assert store.get(newer.doc_id).state is State.RECEIVED
+
+
+def test_sandbox_child_cannot_use_io_uring():
+    code = (
+        "import ctypes, errno, sys; libc = ctypes.CDLL(None, use_errno=True); "
+        "params = ctypes.create_string_buffer(120); "
+        "r = libc.syscall(425, 1, params); "
+        "sys.exit(0 if r == -1 and ctypes.get_errno() == errno.EPERM else 1)"
+    )
+    assert sandbox.run([sys.executable, "-c", code]).returncode == 0
+
+
+def test_sandbox_child_cannot_signal_other_processes():
+    import subprocess
+    import time
+
+    victim = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])  # noqa: S603
+    try:
+        for call in (
+            f"os.kill({victim.pid}, signal.SIGSTOP)",
+            f"os.kill(-{victim.pid}, signal.SIGKILL)",
+            f"signal.pthread_kill({victim.pid}, signal.SIGKILL)",
+        ):
+            r = sandbox.run([sys.executable, "-c", f"import os, signal; {call}"])
+            assert r.returncode != 0, call
+        time.sleep(0.2)
+        assert victim.poll() is None  # still running, not stopped or killed
+        with open(f"/proc/{victim.pid}/stat") as f:
+            assert f.read().split()[2] != "T"
+    finally:
+        victim.kill()
+        victim.wait()
+
+
+def test_sandbox_child_can_still_signal_itself():
+    code = (
+        "import os, signal; signal.signal(signal.SIGUSR1, lambda *a: None); "
+        "os.kill(os.getpid(), signal.SIGUSR1); signal.raise_signal(signal.SIGUSR1)"
+    )
+    assert sandbox.run([sys.executable, "-c", code]).returncode == 0
