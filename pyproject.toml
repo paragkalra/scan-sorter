@@ -9,10 +9,10 @@ description = "Self-hosted, local-only document sorter for home scanners"
 readme = "README.md"
 license = "AGPL-3.0-only"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = ["pikepdf==10.16.0"]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "ruff>=0.6"]
+dev = ["pytest>=8", "ruff>=0.6", "pillow==12.3.0"]
 
 [project.scripts]
 scan-sorter = "scan_sorter.cli:main"

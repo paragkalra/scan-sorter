@@ -341,6 +341,17 @@ class Spool:
                 entries[name] = ident
         return entries
 
+    def open_original(self, store: JobStore, job: Job) -> int:
+        """Read-only fd of a job's adopted private copy (current generation)."""
+        intake = store.stage_result(job.doc_id, Stage.INTAKE) or {}
+        gen_fd = self.open_input_dir(job.doc_id, intake.get("gen", 0))
+        if gen_fd is None:
+            raise FileNotFoundError(job.doc_id)
+        try:
+            return fsutil.open_regular(ORIGINAL, gen_fd)
+        finally:
+            os.close(gen_fd)
+
     def open_input_dir(self, doc_id: str, gen: int, *, create: bool = False) -> int | None:
         """The directory holding one input generation of a job."""
         if create:
