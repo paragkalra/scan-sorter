@@ -70,8 +70,6 @@ ACTIVE_STATES = frozenset(
     }
 )
 TERMINAL_STATES = frozenset({State.COMPLETE, State.DISCARDED})
-# Once a job reaches these states, an object may exist at its destination.
-UPLOAD_STARTED = frozenset({State.UPLOADING, State.VERIFIED})
 
 # Edges usable through advance(). FAILED is entered through fail() and left
 # through retry() or discard(). QUARANTINED -> RECEIVED happens only through
@@ -126,6 +124,7 @@ CREATE TABLE jobs (
     dest_path     TEXT,
     dest_key      TEXT UNIQUE,
     remote_id     TEXT,
+    upload_started_at REAL,
     failure_kind  TEXT,
     failure_code  TEXT,
     failed_from   TEXT,
@@ -157,7 +156,14 @@ CREATE INDEX transitions_doc ON transitions(doc_id);
 
 # Columns describing one particular input file and its filed output. They are
 # reset when a quarantined job's input is replaced.
-_INPUT_COLUMNS = ("source_hash", "output_hash", "dest_path", "dest_key", "remote_id")
+_INPUT_COLUMNS = (
+    "source_hash",
+    "output_hash",
+    "dest_path",
+    "dest_key",
+    "remote_id",
+    "upload_started_at",
+)
 _DB_FILE_MODE = 0o600
 
 
@@ -191,6 +197,7 @@ class Job:
     output_hash: str | None
     dest_path: str | None
     remote_id: str | None
+    upload_started_at: float | None
     failure_kind: FailureKind | None
     failure_code: str | None
     failed_from: State | None
@@ -209,6 +216,7 @@ class Job:
             output_hash=row["output_hash"],
             dest_path=row["dest_path"],
             remote_id=row["remote_id"],
+            upload_started_at=row["upload_started_at"],
             failure_kind=FailureKind(row["failure_kind"]) if row["failure_kind"] else None,
             failure_code=row["failure_code"],
             failed_from=State(row["failed_from"]) if row["failed_from"] else None,
@@ -504,7 +512,11 @@ class JobStore:
         columns: dict[str, str | None] = {"state": to.value}
         if to is State.NEEDS_REVIEW:
             # The category may change in review: release the old destination.
+            # (Review is only reachable before any upload has started.)
             columns.update(output_hash=None, dest_path=None, dest_key=None)
+        if to is State.UPLOADING and job.upload_started_at is None:
+            # Never cleared: from now on an object may exist at the destination.
+            columns["upload_started_at"] = now
         with self._write() as db:
             if frm not in ACTIVE_STATES and to in ACTIVE_STATES:
                 self._check_capacity(db)
@@ -574,7 +586,7 @@ class JobStore:
         # Free the destination for other jobs, unless an upload may already have
         # put an object there: then the name stays reserved until reconciliation
         # (issue #7) confirms the remote path is empty.
-        may_be_uploaded = job.remote_id is not None or job.failed_from in UPLOAD_STARTED
+        may_be_uploaded = job.upload_started_at is not None or job.remote_id is not None
         columns = {} if may_be_uploaded else {"dest_key": None}
         with self._write() as db:
             updated = self._cas(db, job, state=State.DISCARDED.value, **columns)

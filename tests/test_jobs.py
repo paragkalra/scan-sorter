@@ -399,6 +399,16 @@ def test_discard_keeps_destination_when_upload_may_have_happened(store, state):
         store.reserve_destination(new(store, State.CLASSIFIED), a.dest_path)
 
 
+def test_discard_keeps_destination_after_any_upload_attempt(store):
+    # Upload may have created an object without us learning its remote id.
+    a = new(store, State.UPLOADING)
+    a = store.advance(a, State.READY, code="hash_mismatch")
+    assert a.upload_started_at is not None
+    store.discard(store.fail(a, FailureKind.PERMANENT, "gave_up"))
+    with pytest.raises(DestinationTakenError):
+        store.reserve_destination(new(store, State.CLASSIFIED), a.dest_path)
+
+
 def test_discard_keeps_destination_when_a_remote_id_exists(store):
     a = store.set_remote_id(new(store, State.UPLOADING), "id:abc")
     a = store.retry(store.fail(a, FailureKind.RETRYABLE, "net"))
