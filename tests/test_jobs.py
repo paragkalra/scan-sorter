@@ -112,11 +112,89 @@ def test_create_accepts_only_canonical_doc_ids(store, bad):
         store.create("x.pdf", doc_id=bad)
 
 
-def test_create_respects_max_active(store):
-    store.create("a.pdf", max_active=1)
-    with pytest.raises(QueueFullError):
-        store.create("b.pdf", max_active=1)
-    assert store.count_active() == 1
+def test_create_respects_max_active(db_path):
+    with JobStore(db_path, max_active=1) as store:
+        store.create("a.pdf")
+        with pytest.raises(QueueFullError):
+            store.create("b.pdf")
+        assert store.count_active() == 1
+
+
+def _fill(store):
+    """Park job A, then fill the single active slot with job B."""
+    return store.create("b.pdf")
+
+
+def test_retry_respects_capacity(db_path):
+    with JobStore(db_path, max_active=1) as store:
+        failed = store.fail(store.create("a.pdf"), FailureKind.RETRYABLE, "busy")
+        _fill(store)
+        with pytest.raises(QueueFullError):
+            store.retry(failed)
+        assert store.get(failed.doc_id).state is State.FAILED
+        assert store.count_active() == 1
+
+
+def test_review_approval_respects_capacity(db_path):
+    with JobStore(db_path, max_active=1) as store:
+        review = new(store, State.NEEDS_REVIEW)
+        _fill(store)
+        with pytest.raises(QueueFullError):
+            store.advance(review, State.CLASSIFIED, result=(Stage.CLASSIFY, {"category": "x"}))
+        assert store.get(review.doc_id).state is State.NEEDS_REVIEW
+        assert store.stage_result(review.doc_id, Stage.CLASSIFY) is None
+
+
+def test_replace_respects_capacity(db_path):
+    with JobStore(db_path, max_active=1) as store:
+        q = new(store, State.QUARANTINED)
+        _fill(store)
+        with pytest.raises(QueueFullError):
+            store.replace(q, "rescan.pdf")
+        assert store.get(q.doc_id).state is State.QUARANTINED
+
+
+def test_moves_within_active_states_ignore_capacity(db_path):
+    with JobStore(db_path, max_active=1) as store:
+        assert new(store, State.COMPLETE).state is State.COMPLETE
+
+
+class _AfterCommit:
+    """Connection proxy that runs a callback right after the next COMMIT."""
+
+    def __init__(self, real, callback):
+        self._real, self._callback = real, callback
+
+    def execute(self, sql, *args):
+        cur = self._real.execute(sql, *args)
+        if sql == "COMMIT" and self._callback:
+            callback, self._callback = self._callback, None
+            callback()
+        return cur
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def test_writes_return_the_revision_they_produced(db_path):
+    with JobStore(db_path) as store, JobStore(db_path) as other:
+        job = store.create("scan.pdf")
+
+        # Another process quarantines and replaces the input between our commit
+        # and anything we might read afterwards.
+        def interfere():
+            q = other.advance(other.get(job.doc_id), State.QUARANTINED, code="corrupt")
+            other.replace(q, "rescan.pdf")
+
+        real = store._db
+        store._db = _AfterCommit(real, interfere)
+        mine = store.set_source_hash(job, SHA)
+        store._db = real
+        assert mine.revision == job.revision + 1
+        assert mine.source_hash == SHA
+        with pytest.raises(StaleJobError):
+            step(store, mine, State.VALIDATED)
+        assert store.get(job.doc_id).source_name == "rescan.pdf"
 
 
 # -- transitions ---------------------------------------------------------------
@@ -311,6 +389,23 @@ def test_review_releases_the_destination(store):
     a = store.advance(a, State.NEEDS_REVIEW, code="user_flagged")
     assert (a.dest_path, a.output_hash) == (None, None)
     assert store.reserve_destination(new(store, State.CLASSIFIED), "Bills/x.pdf").dest_path
+
+
+@pytest.mark.parametrize("state", [State.UPLOADING, State.VERIFIED])
+def test_discard_keeps_destination_when_upload_may_have_happened(store, state):
+    a = new(store, state)
+    store.discard(store.fail(a, FailureKind.PERMANENT, "gave_up"))
+    with pytest.raises(DestinationTakenError):
+        store.reserve_destination(new(store, State.CLASSIFIED), a.dest_path)
+
+
+def test_discard_keeps_destination_when_a_remote_id_exists(store):
+    a = store.set_remote_id(new(store, State.UPLOADING), "id:abc")
+    a = store.retry(store.fail(a, FailureKind.RETRYABLE, "net"))
+    a = store.advance(a, State.READY, code="hash_mismatch")
+    store.discard(store.fail(a, FailureKind.PERMANENT, "gave_up"))
+    with pytest.raises(DestinationTakenError):
+        store.reserve_destination(new(store, State.CLASSIFIED), a.dest_path)
 
 
 def test_discarding_a_failed_job_releases_its_destination(store):
@@ -523,37 +618,11 @@ def test_many_processes_opening_a_fresh_database_all_succeed(tmp_path):
 
 
 # -- crash recovery ----------------------------------------------------------------
-# A child process dies (os._exit, no cleanup) either mid-transaction or right after
-# a commit. It exits with CRASHED only after reaching that exact point, so an
-# unexpected error in the child (exit status 1) fails the test instead of passing.
+# A child process runs the real advance() and dies (os._exit, no cleanup) at a
+# chosen point inside it. It exits with CRASHED only after reaching that point, so
+# an unexpected error in the child (exit status 1) fails the test instead of passing.
 
 CRASHED = 77
-
-
-def _crash_mid_transition(db_path, doc_id, state):
-    store = JobStore(db_path)
-    store._db.execute("BEGIN IMMEDIATE")
-    cur = store._db.execute(
-        "UPDATE jobs SET state='complete', revision=revision+1 WHERE doc_id=? AND state=?",
-        (doc_id, state.value),
-    )
-    if cur.rowcount == 1:
-        os._exit(CRASHED)
-    os._exit(2)
-
-
-def _crash_after_commit(db_path, doc_id, target):
-    store = JobStore(db_path)
-    step(store, store.get(doc_id), target)
-    os._exit(CRASHED)
-
-
-def _run_child(fn, *args):
-    proc = multiprocessing.get_context("fork").Process(target=fn, args=args)
-    proc.start()
-    proc.join(30)
-    assert proc.exitcode == CRASHED
-
 
 NEXT = {
     State.RECEIVED: State.VALIDATED,
@@ -565,24 +634,101 @@ NEXT = {
     State.VERIFIED: State.COMPLETE,
 }
 
+# Statement prefixes inside advance(); the child dies just before running one.
+BEFORE = ["UPDATE jobs", "INSERT INTO stage_results", "INSERT INTO transitions", "COMMIT"]
 
+
+class _DieAt:
+    def __init__(self, real, prefix, after=False):
+        self._real, self._prefix, self._after = real, prefix, after
+
+    def execute(self, sql, *args):
+        hit = sql.lstrip().startswith(self._prefix)
+        if hit and not self._after:
+            os._exit(CRASHED)
+        cur = self._real.execute(sql, *args)
+        if hit:
+            os._exit(CRASHED)
+        return cur
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def _crash_inside_advance(db_path, doc_id, target, prefix, after):
+    store = JobStore(db_path)
+    job = store.get(doc_id)
+    store._db = _DieAt(store._db, prefix, after)
+    if target is State.READY:
+        store.advance(job, target)  # destination prepared by the parent
+    else:
+        step(store, job, target)
+    os._exit(3)  # the fault point was never reached
+
+
+def _prepare(store, state):
+    """Job in `state`, with any pre-advance writes already committed."""
+    job = new(store, state)
+    if state is State.CLASSIFIED:
+        job = store.set_output_hash(job, OUT_SHA)
+        job = store.reserve_destination(job, f"Bills/{job.doc_id}.pdf")
+    return job
+
+
+def _snapshot(store, doc_id):
+    return (
+        store.get(doc_id),
+        {stage: store.stage_result(doc_id, stage) for stage in Stage},
+        store.history(doc_id),
+    )
+
+
+def _run_child(fn, *args):
+    proc = multiprocessing.get_context("fork").Process(target=fn, args=args)
+    proc.start()
+    proc.join(30)
+    assert proc.exitcode == CRASHED
+
+
+@pytest.mark.parametrize("prefix", BEFORE)
 @pytest.mark.parametrize("state", sorted(ACTIVE_STATES))
-def test_crash_mid_transition_leaves_job_resumable(db_path, state):
+def test_crash_inside_advance_changes_nothing(db_path, state, prefix):
     with JobStore(db_path) as store:
-        job = new(store, state)
-    _run_child(_crash_mid_transition, db_path, job.doc_id, state)
+        job = _prepare(store, state)
+        before = _snapshot(store, job.doc_id)
+    if prefix == "INSERT INTO stage_results" and NEXT[state] not in (
+        State.VALIDATED,
+        State.OCR_DONE,
+        State.CLASSIFIED,
+        State.VERIFIED,
+    ):
+        pytest.skip("this edge stores no stage result")
+    _run_child(_crash_inside_advance, db_path, job.doc_id, NEXT[state], prefix, False)
     with JobStore(db_path) as store:
-        assert store.get(job.doc_id) == job
+        assert _snapshot(store, job.doc_id) == before
         assert job.doc_id in [j.doc_id for j in store.recoverable()]
         # The dead writer's lock is gone: the pipeline can carry on.
-        step(store, job, NEXT[state])
+        if NEXT[state] is State.READY:
+            store.advance(job, State.READY)
+        else:
+            step(store, job, NEXT[state])
 
 
 @pytest.mark.parametrize("state", sorted(ACTIVE_STATES))
-def test_crash_after_commit_keeps_the_transition(db_path, state):
+def test_crash_right_after_commit_keeps_everything(db_path, state):
     with JobStore(db_path) as store:
-        job = new(store, state)
-    _run_child(_crash_after_commit, db_path, job.doc_id, NEXT[state])
+        job = _prepare(store, state)
+    _run_child(_crash_inside_advance, db_path, job.doc_id, NEXT[state], "COMMIT", True)
     with JobStore(db_path) as store:
-        assert store.get(job.doc_id).state is NEXT[state]
+        after = store.get(job.doc_id)
+        assert after.state is NEXT[state]
+        assert after.revision > job.revision
         assert store.history(job.doc_id)[-1][:2] == (state, NEXT[state])
+        required = {
+            State.VALIDATED: Stage.VALIDATE,
+            State.OCR_DONE: Stage.OCR,
+            State.CLASSIFIED: Stage.CLASSIFY,
+            State.VERIFIED: Stage.VERIFY,
+        }.get(NEXT[state])
+        if required:
+            assert store.stage_result(job.doc_id, required) is not None

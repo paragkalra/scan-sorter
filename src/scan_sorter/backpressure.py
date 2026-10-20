@@ -13,11 +13,7 @@ from pathlib import Path
 
 from scan_sorter.jobs import Job, JobStore, QueueFullError
 
-
-@dataclass(frozen=True)
-class Limits:
-    max_active_jobs: int = 50
-    min_free_bytes: int = 1 << 30  # 1 GiB
+DEFAULT_MIN_FREE_BYTES = 1 << 30  # 1 GiB
 
 
 @dataclass(frozen=True)
@@ -27,16 +23,21 @@ class Admission:
 
 
 def admit(
-    store: JobStore, spool: Path, source_name: str, limits: Limits, *, disk_usage=shutil.disk_usage
+    store: JobStore,
+    spool: Path,
+    source_name: str,
+    *,
+    min_free_bytes: int = DEFAULT_MIN_FREE_BYTES,
+    disk_usage=shutil.disk_usage,
 ) -> Admission:
     """Create a job for a new inbox file, or say why intake is paused.
 
-    The queue bound is enforced inside the job store's write transaction, so
-    concurrent intake processes cannot overfill it.
+    The queue bound is the store's max_active, enforced inside its write
+    transaction, so concurrent intake processes cannot overfill it.
     """
-    if disk_usage(spool).free < limits.min_free_bytes:
+    if disk_usage(spool).free < min_free_bytes:
         return Admission(None, "disk_low")
     try:
-        return Admission(store.create(source_name, max_active=limits.max_active_jobs))
+        return Admission(store.create(source_name))
     except QueueFullError:
         return Admission(None, "queue_full")

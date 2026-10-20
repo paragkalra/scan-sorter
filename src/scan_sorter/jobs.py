@@ -70,6 +70,8 @@ ACTIVE_STATES = frozenset(
     }
 )
 TERMINAL_STATES = frozenset({State.COMPLETE, State.DISCARDED})
+# Once a job reaches these states, an object may exist at its destination.
+UPLOAD_STARTED = frozenset({State.UPLOADING, State.VERIFIED})
 
 # Edges usable through advance(). FAILED is entered through fail() and left
 # through retry() or discard(). QUARANTINED -> RECEIVED happens only through
@@ -262,8 +264,20 @@ def _secure_db_files(path: Path) -> None:
 class JobStore:
     """SQLite-backed job store. Safe to open from several processes at once."""
 
-    def __init__(self, path: str | Path, *, clock=time.time, busy_timeout_ms: int = 10_000):
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        max_active: int | None = None,
+        clock=time.time,
+        busy_timeout_ms: int = 10_000,
+    ):
+        """max_active bounds how many jobs may be in ACTIVE_STATES at once. Every
+        way into an active state (intake, retry, review approval, replacement)
+        checks it inside its write transaction and raises QueueFullError, leaving
+        the job where it was, when there is no room."""
         self._clock = clock
+        self._max_active = max_active
         path = Path(path)
         _secure_db_files(path)
         # isolation_level=None: we issue BEGIN IMMEDIATE ourselves so every
@@ -390,14 +404,8 @@ class JobStore:
 
     # -- writes --------------------------------------------------------------
 
-    def create(
-        self, source_name: str, *, doc_id: str | None = None, max_active: int | None = None
-    ) -> Job:
-        """Register a new job in RECEIVED. Committed before the file is moved.
-
-        With max_active, the capacity check and the insert share one write
-        transaction, so concurrent intake can never overfill the queue.
-        """
+    def create(self, source_name: str, *, doc_id: str | None = None) -> Job:
+        """Register a new job in RECEIVED. Committed before the file is moved."""
         if doc_id is None:
             doc_id = uuid.uuid4().hex
         elif not isinstance(doc_id, str) or len(doc_id) != 32 or doc_id != doc_id.lower():
@@ -410,31 +418,31 @@ class JobStore:
                 raise ValueError("doc_id must be 32 lowercase hex characters") from None
         now = self._clock()
         with self._write() as db:
-            if max_active is not None and self._count_active(db) >= max_active:
-                raise QueueFullError
+            self._check_capacity(db)
             db.execute(
                 "INSERT INTO jobs (doc_id, revision, state, source_name, created_at, updated_at)"
                 " VALUES (?,1,?,?,?,?)",
                 (doc_id, State.RECEIVED.value, source_name, now, now),
             )
             self._log(db, doc_id, None, State.RECEIVED, None, now)
-        return self.get(doc_id)
+            created = self._read(db, doc_id)
+        return created
 
     def set_source_hash(self, job: Job, source_hash: str) -> Job:
         _check_sha256(source_hash)
         if job.state is not State.RECEIVED:
             raise TransitionError("source hash is recorded at intake")
         with self._write() as db:
-            self._cas(db, job, source_hash=source_hash)
-        return self.get(job.doc_id)
+            updated = self._cas(db, job, source_hash=source_hash)
+        return updated
 
     def set_output_hash(self, job: Job, output_hash: str) -> Job:
         _check_sha256(output_hash)
         if job.state is not State.CLASSIFIED:
             raise TransitionError("output hash is recorded before the job is ready")
         with self._write() as db:
-            self._cas(db, job, output_hash=output_hash)
-        return self.get(job.doc_id)
+            updated = self._cas(db, job, output_hash=output_hash)
+        return updated
 
     def reserve_destination(self, job: Job, dest_path: str) -> Job:
         """Reserve a destination path for this job before it is uploaded.
@@ -448,10 +456,12 @@ class JobStore:
             raise ValueError("invalid destination path")
         with self._write() as db:
             try:
-                self._cas(db, job, dest_path=dest_path, dest_key=destination_key(dest_path))
+                updated = self._cas(
+                    db, job, dest_path=dest_path, dest_key=destination_key(dest_path)
+                )
             except sqlite3.IntegrityError:
                 raise DestinationTakenError from None
-        return self.get(job.doc_id)
+        return updated
 
     def set_remote_id(self, job: Job, remote_id: str) -> Job:
         if job.state is not State.UPLOADING:
@@ -459,8 +469,8 @@ class JobStore:
         if not remote_id or len(remote_id) > 512:
             raise ValueError("invalid remote id")
         with self._write() as db:
-            self._cas(db, job, remote_id=remote_id)
-        return self.get(job.doc_id)
+            updated = self._cas(db, job, remote_id=remote_id)
+        return updated
 
     def advance(
         self,
@@ -496,7 +506,9 @@ class JobStore:
             # The category may change in review: release the old destination.
             columns.update(output_hash=None, dest_path=None, dest_key=None)
         with self._write() as db:
-            self._cas(db, job, **columns)
+            if frm not in ACTIVE_STATES and to in ACTIVE_STATES:
+                self._check_capacity(db)
+            updated = self._cas(db, job, **columns)
             if result is not None:
                 db.execute(
                     "INSERT INTO stage_results (doc_id, stage, data, recorded_at) VALUES (?,?,?,?)"
@@ -513,7 +525,7 @@ class JobStore:
             ):
                 raise TransitionError(f"entering {to} needs a {required} result")
             self._log(db, job.doc_id, frm, to, code, now)
-        return self.get(job.doc_id)
+        return updated
 
     def fail(self, job: Job, kind: FailureKind, code: str) -> Job:
         """Park an active job as FAILED, remembering where to resume on retry."""
@@ -522,7 +534,7 @@ class JobStore:
         _check_code(code)
         now = self._clock()
         with self._write() as db:
-            self._cas(
+            updated = self._cas(
                 db,
                 job,
                 attempts_increment=True,
@@ -532,7 +544,7 @@ class JobStore:
                 failed_from=job.state.value,
             )
             self._log(db, job.doc_id, job.state, State.FAILED, code, now)
-        return self.get(job.doc_id)
+        return updated
 
     def retry(self, job: Job) -> Job:
         """Return a retryable failure to the state it failed from."""
@@ -542,7 +554,8 @@ class JobStore:
             raise TransitionError("permanent failures cannot be retried")
         now = self._clock()
         with self._write() as db:
-            self._cas(
+            self._check_capacity(db)
+            updated = self._cas(
                 db,
                 job,
                 state=job.failed_from.value,
@@ -551,18 +564,22 @@ class JobStore:
                 failed_from=None,
             )
             self._log(db, job.doc_id, State.FAILED, job.failed_from, "retry", now)
-        return self.get(job.doc_id)
+        return updated
 
     def discard(self, job: Job) -> Job:
         """Give up on a job awaiting a person (review, quarantine, or failure)."""
         if job.state not in (State.NEEDS_REVIEW, State.QUARANTINED, State.FAILED):
             raise TransitionError(f"cannot discard a job in {job.state}")
         now = self._clock()
+        # Free the destination for other jobs, unless an upload may already have
+        # put an object there: then the name stays reserved until reconciliation
+        # (issue #7) confirms the remote path is empty.
+        may_be_uploaded = job.remote_id is not None or job.failed_from in UPLOAD_STARTED
+        columns = {} if may_be_uploaded else {"dest_key": None}
         with self._write() as db:
-            # Free the destination so another job can use the name.
-            self._cas(db, job, state=State.DISCARDED.value, dest_key=None)
+            updated = self._cas(db, job, state=State.DISCARDED.value, **columns)
             self._log(db, job.doc_id, job.state, State.DISCARDED, "discard", now)
-        return self.get(job.doc_id)
+        return updated
 
     def replace(self, job: Job, source_name: str) -> Job:
         """Restart a quarantined job with a replacement input file.
@@ -575,7 +592,8 @@ class JobStore:
             raise TransitionError("only quarantined jobs take a replacement input")
         now = self._clock()
         with self._write() as db:
-            self._cas(
+            self._check_capacity(db)
+            updated = self._cas(
                 db,
                 job,
                 state=State.RECEIVED.value,
@@ -584,7 +602,7 @@ class JobStore:
             )
             db.execute("DELETE FROM stage_results WHERE doc_id=?", (job.doc_id,))
             self._log(db, job.doc_id, State.QUARANTINED, State.RECEIVED, "replaced", now)
-        return self.get(job.doc_id)
+        return updated
 
     def _cas(
         self,
@@ -593,7 +611,7 @@ class JobStore:
         *,
         attempts_increment: bool = False,
         **columns: str | None,
-    ) -> None:
+    ) -> Job:
         sets = "".join(f", {name}=?" for name in columns)
         bump = ", attempts=attempts+1" if attempts_increment else ""
         cur = db.execute(
@@ -602,11 +620,21 @@ class JobStore:
             [self._clock(), *columns.values(), job.doc_id, job.revision, job.state.value],
         )
         if cur.rowcount == 1:
-            return
+            return self._read(db, job.doc_id)
         row = db.execute("SELECT 1 FROM jobs WHERE doc_id=?", (job.doc_id,)).fetchone()
         if row is None:
             raise JobNotFoundError(job.doc_id)
         raise StaleJobError(f"job {job.doc_id} changed since revision {job.revision}")
+
+    @staticmethod
+    def _read(db: sqlite3.Connection, doc_id: str) -> Job:
+        # Snapshot taken inside the write transaction: the revision returned to
+        # the caller is exactly the one this write produced.
+        return Job._from_row(db.execute("SELECT * FROM jobs WHERE doc_id=?", (doc_id,)).fetchone())
+
+    def _check_capacity(self, db: sqlite3.Connection) -> None:
+        if self._max_active is not None and self._count_active(db) >= self._max_active:
+            raise QueueFullError
 
     @staticmethod
     def _log(
