@@ -20,16 +20,7 @@ IN_MOVED_FROM = 0x00000040
 IN_MOVED_TO = 0x00000080
 IN_CREATE = 0x00000100
 IN_DELETE = 0x00000200
-WATCH_MASK = (
-    IN_MODIFY
-    | IN_CLOSE_WRITE
-    | IN_CLOSE_NOWRITE
-    | IN_OPEN
-    | IN_MOVED_FROM
-    | IN_MOVED_TO
-    | IN_CREATE
-    | IN_DELETE
-)
+WATCH_MASK = IN_MODIFY | IN_CLOSE_WRITE | IN_MOVED_FROM | IN_MOVED_TO | IN_CREATE | IN_DELETE
 IN_Q_OVERFLOW = 0x00004000
 IN_NONBLOCK = 0o4000
 IN_CLOEXEC = 0o2000000
@@ -38,8 +29,8 @@ _HEADER = struct.Struct("iIII")
 
 
 class Inotify:
-    """Watches one directory's entries: opens, writes, closes, creates, moves
-    and deletes, in the order they happened."""
+    """Watches one directory's entries: writes, closes after writing, creates,
+    moves and deletes, in the order they happened."""
 
     def __init__(self, dir_fd: int):
         libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno=True)

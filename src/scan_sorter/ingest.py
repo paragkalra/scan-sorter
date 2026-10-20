@@ -43,14 +43,12 @@ from scan_sorter import fsutil
 from scan_sorter.backpressure import DEFAULT_MIN_FREE_BYTES, disk_has_room
 from scan_sorter.fsutil import Identity
 from scan_sorter.inotify import (
-    IN_CLOSE_NOWRITE,
     IN_CLOSE_WRITE,
     IN_CREATE,
     IN_DELETE,
     IN_MODIFY,
     IN_MOVED_FROM,
     IN_MOVED_TO,
-    IN_OPEN,
     try_inotify,
 )
 from scan_sorter.jobs import (
@@ -111,18 +109,15 @@ class _Handles:
     renames inside the inbox (so a temp file renamed into place keeps its
     open writers)."""
 
-    watched: bool  # we saw it created here, so we know all its handles
-    opens: int = 0
+    watched: bool  # we saw it created here, so a close event will come
     closed: bool = False  # a writer closed it after its last write
 
     def apply(self, mask: int) -> None:
-        if mask & IN_OPEN:
-            self.opens += 1
+        # Open handles are deliberately not counted: the kernel merges
+        # identical queued events, so counts drift both ways. Whether a writer
+        # still has the file open is settled by the read lease at adoption.
         if mask & IN_MODIFY:
             self.closed = False
-        if mask & (IN_CLOSE_WRITE | IN_CLOSE_NOWRITE):
-            # Clamped: handles opened before we started watching are unknown.
-            self.opens = max(0, self.opens - 1)
         if mask & IN_CLOSE_WRITE:
             self.closed = True
 
@@ -136,8 +131,9 @@ class GateResult:
 class TransferGate:
     """Decides when an inbox entry has finished arriving.
 
-    With reliable events, a file is ready once a writer closed it, no handle
-    is open on it any more, and it stayed unchanged for `stable_seconds`. A
+    With reliable events, a file is ready once a writer closed it and it then
+    stayed unchanged for `stable_seconds` (adoption still refuses it while any
+    writer has it open, via a kernel read lease). A
     file whose arrival we could not watch (no inotify, already there at
     startup, or present during an event-queue overflow) is ready after
     `fallback_stable_seconds` unchanged.
@@ -206,9 +202,7 @@ class TransferGate:
                 ready.append(name)  # quarantined on adoption; nothing to wait for
             handles = self._handles.get(name)
             needs_close = handles.watched if handles else seen.needs_close
-            if handles and handles.opens:
-                pass  # someone still has it open
-            elif handles and handles.closed and quiet >= self.stable_seconds:
+            if handles and handles.closed and quiet >= self.stable_seconds:
                 ready.append(name)
             elif not needs_close and quiet >= self.fallback_stable_seconds:
                 ready.append(name)

@@ -11,7 +11,7 @@ import pytest
 from scan_sorter import fsutil, ingest
 from scan_sorter.fsutil import Identity
 from scan_sorter.ingest import INCOMING, ORIGINAL, Spool, SpoolBusyError, TransferGate, Watcher
-from scan_sorter.inotify import IN_CLOSE_NOWRITE, IN_CLOSE_WRITE, IN_MODIFY, IN_OPEN
+from scan_sorter.inotify import IN_CLOSE_WRITE, IN_MODIFY
 from scan_sorter.jobs import FailureKind, JobStore, QueueFullError, Stage, State
 
 Usage = namedtuple("Usage", "total used free")
@@ -948,35 +948,6 @@ def test_files_discovered_during_an_overflow_use_the_fallback(dirs, spool, store
     w.close()
 
 
-def test_gate_reopened_file_waits_for_the_new_handle_to_close():
-    clock = Clock()
-    gate = started_gate(clock)
-    gate.observe({"a": ident()}, [("a", IN_CLOSE_WRITE)], events_reliable=True)
-    gate.observe({"a": ident()}, [("a", IN_OPEN)], events_reliable=True)  # reopened, no write
-    clock.t += 100
-    assert gate.observe({"a": ident()}, events_reliable=True).ready == []
-    gate.observe({"a": ident()}, [("a", IN_CLOSE_WRITE)], events_reliable=True)
-    clock.t += 10
-    assert gate.observe({"a": ident()}, events_reliable=True).ready == ["a"]
-
-
-def test_gate_a_reader_does_not_cancel_a_finished_write():
-    clock = Clock()
-    gate = started_gate(clock)
-    events = [("a", IN_CLOSE_WRITE), ("a", IN_OPEN), ("a", IN_CLOSE_NOWRITE)]
-    gate.observe({"a": ident()}, events, events_reliable=True)
-    clock.t += 10
-    assert gate.observe({"a": ident()}, events_reliable=True).ready == ["a"]
-
-
-def test_gate_open_handles_also_block_the_fallback():
-    clock = Clock()
-    gate = make_gate(clock)
-    gate.observe({"a": ident()}, [("a", IN_OPEN)], events_reliable=True)  # startup file
-    clock.t += 100
-    assert gate.observe({"a": ident()}, events_reliable=True).ready == []
-
-
 def test_watcher_waits_for_a_writer_that_reopens_without_writing(dirs, spool, store, clock):
     inbox, spool_dir = dirs
     w = make_watcher(store, spool, clock)
@@ -1353,3 +1324,23 @@ def test_orphan_whose_newest_generation_is_empty_is_still_registered(dirs, spool
     job = store.get(doc_id)
     assert (job.state, last_code(store, job)) == (State.QUARANTINED, "orphaned_generations")
     assert store.stage_result(doc_id, Stage.INTAKE)["gen"] == 0
+
+
+def test_merged_close_events_do_not_block_a_finished_upload(dirs, spool, store, clock):
+    inbox, spool_dir = dirs
+    w = make_watcher(store, spool, clock)
+    if w.inotify is None:
+        pytest.skip("inotify unavailable")
+    w.poll_once()
+    a = open(inbox / "scan.pdf", "wb")  # noqa: SIM115
+    b = open(inbox / "scan.pdf", "ab")  # noqa: SIM115
+    a.write(b"page one")
+    a.flush()
+    b.write(b" page two")
+    a.close()
+    b.close()  # its IN_CLOSE_WRITE may merge with a's
+    w.poll_once()
+    clock.t += 10
+    [doc] = w.poll_once().adopted
+    assert original(spool_dir, doc).read_bytes() == b"page one page two"
+    w.close()
