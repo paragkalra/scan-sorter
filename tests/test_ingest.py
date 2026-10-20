@@ -10,7 +10,8 @@ import pytest
 
 from scan_sorter import fsutil, ingest
 from scan_sorter.fsutil import Identity
-from scan_sorter.ingest import INCOMING, ORIGINAL, Spool, TransferGate, Watcher
+from scan_sorter.ingest import INCOMING, ORIGINAL, Spool, SpoolBusyError, TransferGate, Watcher
+from scan_sorter.inotify import IN_CLOSE_NOWRITE, IN_CLOSE_WRITE, IN_MODIFY, IN_OPEN
 from scan_sorter.jobs import FailureKind, JobStore, QueueFullError, Stage, State
 
 Usage = namedtuple("Usage", "total used free")
@@ -90,7 +91,7 @@ def started_gate(clock):
 def test_gate_closed_file_is_ready_after_stable_window():
     clock = Clock()
     gate = started_gate(clock)
-    assert gate.observe({"a": ident()}, ["a"], events_reliable=True).ready == []
+    assert gate.observe({"a": ident()}, [("a", IN_CLOSE_WRITE)], events_reliable=True).ready == []
     clock.t += 9
     assert gate.observe({"a": ident()}, events_reliable=True).ready == []
     clock.t += 1
@@ -131,12 +132,12 @@ def test_gate_without_events_uses_fallback_window():
 def test_gate_change_restarts_the_window_and_clears_close():
     clock = Clock()
     gate = started_gate(clock)
-    gate.observe({"a": ident(size=10)}, ["a"], events_reliable=True)
+    gate.observe({"a": ident(size=10)}, [("a", IN_CLOSE_WRITE)], events_reliable=True)
     clock.t += 9
     gate.observe({"a": ident(size=20)}, events_reliable=True)  # reopened, appended
     clock.t += 100
     assert gate.observe({"a": ident(size=20)}, events_reliable=True).ready == []
-    gate.observe({"a": ident(size=20)}, ["a"], events_reliable=True)
+    gate.observe({"a": ident(size=20)}, [("a", IN_CLOSE_WRITE)], events_reliable=True)
     clock.t += 10
     assert gate.observe({"a": ident(size=20)}, events_reliable=True).ready == ["a"]
 
@@ -169,7 +170,7 @@ def test_gate_non_regular_entries_are_ready_at_once():
 def test_gate_overflow_falls_back_to_stability_window():
     clock = Clock()
     gate = started_gate(clock)
-    gate.observe({"a": ident()}, ["a"], events_reliable=True)
+    gate.observe({"a": ident()}, [("a", IN_CLOSE_WRITE)], events_reliable=True)
     gate.forget_closed()
     clock.t += 10
     assert gate.observe({"a": ident()}, events_reliable=True).ready == []
@@ -180,7 +181,7 @@ def test_gate_overflow_falls_back_to_stability_window():
 def test_gate_forgets_vanished_names_and_ignores_unknown_closes():
     gate = started_gate(Clock())
     gate.observe({"a": ident()})
-    assert gate.observe({}, ["ghost"]).ready == []
+    assert gate.observe({}, [("ghost", IN_CLOSE_WRITE)]).ready == []
     assert gate._seen == {}
 
 
@@ -762,29 +763,25 @@ def test_run_reconciles_first_and_stops(dirs, spool, store, clock):
 def test_gate_later_event_cancels_an_earlier_close():
     clock = Clock()
     gate = started_gate(clock)
-    gate.observe({"a": ident()}, {"a": True}, events_reliable=True)
-    gate.observe({"a": ident()}, {"a": False}, events_reliable=True)
+    gate.observe({"a": ident()}, [("a", IN_CLOSE_WRITE)], events_reliable=True)
+    gate.observe({"a": ident()}, [("a", IN_MODIFY)], events_reliable=True)
     clock.t += 100
     assert gate.observe({"a": ident()}, events_reliable=True).ready == []
 
 
-def test_inotify_reports_the_latest_event_per_name(dirs, spool):
-    from scan_sorter.inotify import try_inotify
+def test_inotify_reports_events_in_order(dirs, spool):
+    from scan_sorter.inotify import IN_CREATE, IN_DELETE, try_inotify
 
     inbox, _ = dirs
     ino = try_inotify(spool.inbox_fd)
     if ino is None:
         pytest.skip("inotify unavailable")
     try:
-        write(inbox / "a.pdf")  # created, written, closed
+        write(inbox / "a.pdf")
         (inbox / "a.pdf").unlink()
-        handle = open(inbox / "a.pdf", "wb")  # noqa: SIM115
-        handle.write(b"still writing")
-        handle.flush()
-        write(inbox / "b.pdf")
-        assert ino.read() == {b"a.pdf": False, b"b.pdf": True}
-        handle.close()
-        assert ino.read() == {b"a.pdf": True}
+        masks = [m for n, m in ino.read() if n == b"a.pdf"]
+        assert masks[0] & IN_CREATE and masks[-1] & IN_DELETE
+        assert any(m & IN_CLOSE_WRITE for m in masks)
     finally:
         ino.close()
 
@@ -896,3 +893,96 @@ def test_files_discovered_during_an_overflow_use_the_fallback(dirs, spool, store
     clock.t += 60
     assert len(w.poll_once().adopted) == 1
     w.close()
+
+
+def test_gate_reopened_file_waits_for_the_new_handle_to_close():
+    clock = Clock()
+    gate = started_gate(clock)
+    gate.observe({"a": ident()}, [("a", IN_CLOSE_WRITE)], events_reliable=True)
+    gate.observe({"a": ident()}, [("a", IN_OPEN)], events_reliable=True)  # reopened, no write
+    clock.t += 100
+    assert gate.observe({"a": ident()}, events_reliable=True).ready == []
+    gate.observe({"a": ident()}, [("a", IN_CLOSE_WRITE)], events_reliable=True)
+    clock.t += 10
+    assert gate.observe({"a": ident()}, events_reliable=True).ready == ["a"]
+
+
+def test_gate_a_reader_does_not_cancel_a_finished_write():
+    clock = Clock()
+    gate = started_gate(clock)
+    events = [("a", IN_CLOSE_WRITE), ("a", IN_OPEN), ("a", IN_CLOSE_NOWRITE)]
+    gate.observe({"a": ident()}, events, events_reliable=True)
+    clock.t += 10
+    assert gate.observe({"a": ident()}, events_reliable=True).ready == ["a"]
+
+
+def test_gate_open_handles_also_block_the_fallback():
+    clock = Clock()
+    gate = make_gate(clock)
+    gate.observe({"a": ident()}, [("a", IN_OPEN)], events_reliable=True)  # startup file
+    clock.t += 100
+    assert gate.observe({"a": ident()}, events_reliable=True).ready == []
+
+
+def test_watcher_waits_for_a_writer_that_reopens_without_writing(dirs, spool, store, clock):
+    inbox, spool_dir = dirs
+    w = make_watcher(store, spool, clock)
+    if w.inotify is None:
+        pytest.skip("inotify unavailable")
+    w.poll_once()
+    write(inbox / "scan.pdf", b"page one")
+    w.poll_once()
+    with open(inbox / "scan.pdf", "ab") as f:
+        w.poll_once()
+        clock.t += 120
+        assert w.poll_once().adopted == []
+        f.write(b" page two")
+    w.poll_once()
+    clock.t += 10
+    [doc] = w.poll_once().adopted
+    assert original(spool_dir, doc).read_bytes() == b"page one page two"
+    w.close()
+
+
+def test_only_one_process_can_own_a_spool(dirs):
+    with Spool(*dirs):
+        with pytest.raises(SpoolBusyError):
+            Spool(*dirs)
+    with Spool(*dirs):
+        pass  # released on close
+
+
+def test_quarantine_recovery_redoes_barriers_first(dirs, spool, store, monkeypatch):
+    inbox, spool_dir = dirs
+    st = write(inbox / "slow.pdf", b"partial")
+    job = _registered(store, "slow.pdf", st, quarantine="incomplete_transfer")
+    g = gen_dir(spool_dir, job.doc_id)
+    g.mkdir(parents=True)
+    os.rename(inbox / "slow.pdf", g / INCOMING)
+    events = []
+    real_fsync, real_advance = os.fsync, store.advance
+
+    def fsync(fd):
+        events.append(os.readlink(f"/proc/self/fd/{fd}"))
+        real_fsync(fd)
+
+    def advance(*a, **k):
+        events.append("COMMIT")
+        return real_advance(*a, **k)
+
+    monkeypatch.setattr(fsutil.os, "fsync", fsync)
+    store.advance = advance
+    spool.reconcile(store)
+    before = events[: events.index("COMMIT")]
+    for needed in (str(g / INCOMING), str(g), str(g.parent), str(spool_dir / "jobs"), str(inbox)):
+        assert needed in before, needed
+
+
+def test_orphan_with_only_an_unverified_input_is_quarantined(dirs, spool, store):
+    _, spool_dir = dirs
+    doc_id = "12" * 16
+    gen_dir(spool_dir, doc_id).mkdir(parents=True)
+    (gen_dir(spool_dir, doc_id) / INCOMING).write_bytes(b"half moved")
+    assert spool.reconcile(store) == [doc_id]
+    job = store.get(doc_id)
+    assert (job.state, last_code(store, job)) == (State.QUARANTINED, "orphaned_input")
