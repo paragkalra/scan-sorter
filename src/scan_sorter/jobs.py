@@ -76,7 +76,8 @@ TERMINAL_STATES = frozenset({State.COMPLETE, State.DISCARDED})
 # through retry() or discard(). QUARANTINED -> RECEIVED happens only through
 # replace(), which also clears everything derived from the old input.
 TRANSITIONS: Mapping[State, frozenset[State]] = {
-    State.RECEIVED: frozenset({State.VALIDATED, State.QUARANTINED}),
+    # RECEIVED -> DISCARDED: a duplicate of a document already handled.
+    State.RECEIVED: frozenset({State.VALIDATED, State.QUARANTINED, State.DISCARDED}),
     State.VALIDATED: frozenset({State.OCR_DONE, State.QUARANTINED}),
     # Review is only offered once OCR has run (e.g. it found no text).
     State.OCR_DONE: frozenset({State.CLASSIFIED, State.NEEDS_REVIEW}),
@@ -105,6 +106,7 @@ FRESH_RESULT_REQUIRED = frozenset({(State.NEEDS_REVIEW, State.CLASSIFIED)})
 CODE_REQUIRED = frozenset(
     {
         (State.RECEIVED, State.QUARANTINED),
+        (State.RECEIVED, State.DISCARDED),
         (State.VALIDATED, State.QUARANTINED),
         (State.OCR_DONE, State.NEEDS_REVIEW),
         (State.CLASSIFIED, State.NEEDS_REVIEW),
