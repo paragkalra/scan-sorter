@@ -25,6 +25,7 @@ directory with the original it replaces.
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import fcntl
 import logging
@@ -262,6 +263,8 @@ class Spool:
         the inbox files' owner (the scanner UID); disable it only where leases
         are unavailable, accepting the stability window as the only guard."""
         self.require_no_writers = require_no_writers
+        if require_no_writers:
+            fsutil.ignore_lease_signals()
         self.inbox_fd = fsutil.open_dir(inbox)
         try:
             self.spool_fd = fsutil.open_dir(spool)
@@ -360,9 +363,14 @@ class Spool:
             raise SourceChangedError(name)
         if not quarantine_code and current.is_regular and self.require_no_writers:
             # inotify open/close counts are hints (the kernel merges repeated
-            # events); the lease check is the authority on open writers.
-            if fsutil.has_writers(name, self.inbox_fd) is not False:
-                raise SourceChangedError(name)
+            # events); the lease is the authority on open writers. This probe
+            # avoids registering a job for a file still being written; resume()
+            # holds a lease for real while moving and copying.
+            try:
+                if fsutil.has_writers(name, self.inbox_fd):
+                    raise SourceChangedError(name)
+            except FileNotFoundError:
+                raise SourceChangedError(name) from None
         job = store.create(
             fsutil.display_name(os.fsencode(name)),
             intake=_intake(name, current, 0, quarantine_code),
@@ -372,7 +380,11 @@ class Spool:
         return self.resume(store, job)
 
     def resume(self, store: JobStore, job: Job) -> Job:
-        """Carry a RECEIVED job without a hash through whatever steps remain."""
+        """Carry a RECEIVED job without a hash through whatever steps remain.
+
+        If a writer still has the input open, the job is left as it is (still
+        RECEIVED, no hash) and the watcher retries it on a later poll.
+        """
         intake = store.stage_result(job.doc_id, Stage.INTAKE)
         if intake is None:
             return store.fail(job, FailureKind.PERMANENT, "source_missing")
@@ -380,85 +392,145 @@ class Spool:
         # Recovered orphans have no inbox identity: only a finished copy counts.
         expected = Identity.from_dict(intake) if "dev" in intake else None
         quarantine = intake.get("quarantine")
+        name = (
+            os.fsdecode(bytes.fromhex(intake["inbox_name_hex"]))
+            if "inbox_name_hex" in intake
+            else None
+        )
         gen_fd = self.open_input_dir(job.doc_id, gen, create=True)
         try:
-            have_original = fsutil.lstat_at(ORIGINAL, gen_fd) is not None
+            if fsutil.lstat_at(ORIGINAL, gen_fd) is not None:
+                return self._finish(store, job, gen_fd)
             have_incoming = fsutil.lstat_at(INCOMING, gen_fd) is not None
-            if expected is None and not have_original and not (have_incoming and quarantine):
+            if not have_incoming and (expected is None or name is None):
                 return store.fail(job, FailureKind.PERMANENT, "source_missing")
-            if not have_original and not have_incoming:
-                try:
-                    self._take_from_inbox(intake, expected, quarantine, gen_fd)
-                except SourceMissingError:
-                    return store.fail(job, FailureKind.PERMANENT, "source_missing")
-            if not have_original:
-                code = self._make_private_copy(gen_fd, expected, quarantine)
-                if code is not None:
-                    # Make the moved input durable before the row says where it is.
-                    self._barrier(job.doc_id, gen_fd, INCOMING)
-                    log.info("job %s quarantined: %s", job.doc_id, code)
-                    return store.advance(job, State.QUARANTINED, code=code)
+            try:
+                if have_incoming:
+                    code = self._adopt_incoming(gen_fd, expected, quarantine)
+                else:
+                    job, code = self._adopt_from_inbox(
+                        store, job, name, gen_fd, expected, quarantine
+                    )
+            except SourceMissingError:
+                return store.fail(job, FailureKind.PERMANENT, "source_missing")
+            except fsutil.WriterActiveError:
+                log.info("job %s waits for a writer to finish", job.doc_id)
+                return job
+            if code is not None:
+                # Make the moved input durable before the row says where it is.
+                self._barrier(job.doc_id, gen_fd, INCOMING)
+                log.info("job %s quarantined: %s", job.doc_id, code)
+                return store.advance(job, State.QUARANTINED, code=code)
             return self._finish(store, job, gen_fd)
         finally:
             os.close(gen_fd)
 
-    def _take_from_inbox(
-        self, intake: dict, expected: Identity, quarantine: str | None, gen_fd: int
-    ) -> None:
-        name = os.fsdecode(bytes.fromhex(intake["inbox_name_hex"]))
-        current = fsutil.lstat_at(name, self.inbox_fd)
-        # Full identity unless quarantining a growing file: inode numbers get
-        # reused, so a new scan under the same name can share one.
-        if current is None or not (
-            current.same_file(expected) if quarantine else current.same_content(expected)
-        ):
-            raise SourceMissingError(name)
-        if current.is_regular:
-            # The printer's bytes must be durable before the entry leaves the
-            # inbox durably; quarantined files are never copied, so this is
-            # their only barrier.
-            try:
-                fsutil.fsync_file(name, self.inbox_fd)
-            except FileNotFoundError:
-                raise SourceMissingError(name) from None
-        try:
-            os.rename(name, INCOMING, src_dir_fd=self.inbox_fd, dst_dir_fd=gen_fd)
-        except FileNotFoundError:
-            # Deleted, or taken by another adopter, after the check above.
-            raise SourceMissingError(name) from None
-        os.fsync(self.inbox_fd)
-        os.fsync(gen_fd)
+    def _adopt_from_inbox(
+        self,
+        store: JobStore,
+        job: Job,
+        name: str,
+        gen_fd: int,
+        expected: Identity,
+        quarantine: str | None,
+    ) -> tuple[Job, str | None]:
+        """Move the inbox entry to INCOMING and, unless quarantining, copy it.
 
-    @staticmethod
-    def _make_private_copy(
-        gen_fd: int, expected: Identity | None, quarantine: str | None
+        For a normal adoption the read lease is taken before the move and held
+        until the copy is done, so no writer can be active at any point in
+        between. Returns the (possibly updated) job and a quarantine code, or
+        None once ORIGINAL exists.
+        """
+        current = fsutil.lstat_at(name, self.inbox_fd)
+        if current is None or not current.same_file(expected):
+            raise SourceMissingError(name)
+        if quarantine or not current.is_regular:
+            if current.is_regular:
+                # Quarantined files are never copied: this is their only barrier.
+                self._fsync_or_missing(name)
+            self._move_to_incoming(name, gen_fd)
+            return job, quarantine or "not_regular_file"
+        try:
+            fd = fsutil.open_regular(name, self.inbox_fd)
+        except FileNotFoundError:
+            raise SourceMissingError(name) from None
+        try:
+            if not Identity.of(os.fstat(fd)).same_file(expected):
+                raise SourceMissingError(name)  # swapped between lstat and open
+            with self._exclusion(fd) as lease:
+                now = Identity.of(os.fstat(fd))
+                if not now.same_content(expected):
+                    # Written to since registration (a deferred job whose
+                    # writer has now closed it): record what we are adopting.
+                    intake = dict(store.stage_result(job.doc_id, Stage.INTAKE))
+                    intake.update(now.as_dict())
+                    job = store.update_intake(job, intake)
+                    expected = now
+                # The printer's bytes must be durable before the entry leaves
+                # the inbox durably.
+                os.fsync(fd)
+                self._move_to_incoming(name, gen_fd)
+                return job, self._copy(fd, gen_fd, expected, lease)
+        finally:
+            os.close(fd)
+
+    def _adopt_incoming(
+        self, gen_fd: int, expected: Identity | None, quarantine: str | None
     ) -> str | None:
-        """Copy INCOMING to ORIGINAL; return a quarantine code instead if needed."""
+        """Finish an adoption whose input was already moved (crash recovery)."""
         if quarantine:
             return quarantine
         incoming = fsutil.lstat_at(INCOMING, gen_fd)
         if incoming is None or not incoming.is_regular:
             return "not_regular_file"
-        if expected is None or not incoming.same_content(expected):
-            return "changed_during_adoption"
-        if incoming.nlink > 1:
-            # Another name still points at this inode, possibly in the share.
-            return "multiple_links"
         try:
-            src = fsutil.open_regular(INCOMING, gen_fd)
+            fd = fsutil.open_regular(INCOMING, gen_fd)
         except OSError:
             return "not_regular_file"
         try:
-            try:
-                os.unlink(_TMP, dir_fd=gen_fd)
-            except FileNotFoundError:
-                pass
-            _, stable = fsutil.private_copy(src, _TMP, gen_fd)
+            with self._exclusion(fd) as lease:
+                return self._copy(fd, gen_fd, expected, lease)
         finally:
-            os.close(src)
-        if not stable:
-            os.unlink(_TMP, dir_fd=gen_fd)
+            os.close(fd)
+
+    def _exclusion(self, fd: int):
+        return fsutil.ReadLease(fd) if self.require_no_writers else contextlib.nullcontext()
+
+    def _fsync_or_missing(self, name: str) -> None:
+        try:
+            fsutil.fsync_file(name, self.inbox_fd)
+        except FileNotFoundError:
+            raise SourceMissingError(name) from None
+
+    def _move_to_incoming(self, name: str, gen_fd: int) -> None:
+        try:
+            os.rename(name, INCOMING, src_dir_fd=self.inbox_fd, dst_dir_fd=gen_fd)
+        except FileNotFoundError:
+            # Deleted, or taken by another adopter, after the checks.
+            raise SourceMissingError(name) from None
+        os.fsync(self.inbox_fd)
+        os.fsync(gen_fd)
+
+    @staticmethod
+    def _copy(
+        fd: int, gen_fd: int, expected: Identity | None, lease: fsutil.ReadLease | None
+    ) -> str | None:
+        """Copy the open input into ORIGINAL; return a quarantine code instead if needed."""
+        st = Identity.of(os.fstat(fd))
+        if expected is None or not st.same_content(expected):
             return "changed_during_adoption"
+        if st.nlink > 1:
+            # Another name still points at this inode, possibly in the share.
+            return "multiple_links"
+        try:
+            os.unlink(_TMP, dir_fd=gen_fd)
+        except FileNotFoundError:
+            pass
+        _, stable = fsutil.private_copy(fd, _TMP, gen_fd)
+        if not stable or (lease is not None and not lease.intact()):
+            # Written to, or a writer opened it and is waiting on our lease.
+            os.unlink(_TMP, dir_fd=gen_fd)
+            return "changed_during_adoption" if not stable else "writer_during_adoption"
         os.rename(_TMP, ORIGINAL, src_dir_fd=gen_fd, dst_dir_fd=gen_fd)
         os.fsync(gen_fd)
         return None
@@ -639,8 +711,9 @@ class Watcher:
                 report.quarantined.append(job.doc_id)
             elif job.state is State.FAILED:
                 report.failed.append(job.doc_id)
-            else:
+            elif job.source_hash is not None:
                 report.adopted.append(job.doc_id)
+            # else: registered, waiting for a writer; resumed on a later poll
         if report.paused:
             # Files stay in the inbox and are picked up on a later poll.
             log.info("intake paused: %s", report.paused)

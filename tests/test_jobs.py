@@ -742,3 +742,12 @@ def test_crash_right_after_commit_keeps_everything(db_path, state):
         }.get(NEXT[state])
         if required:
             assert store.stage_result(job.doc_id, required) is not None
+
+
+def test_update_intake_only_before_adoption(store):
+    job = store.create("scan.pdf", intake={"size": 1})
+    job = store.update_intake(job, {"size": 2})
+    assert store.stage_result(job.doc_id, Stage.INTAKE) == {"size": 2}
+    job = store.set_source_hash(job, SHA)
+    with pytest.raises(TransitionError):
+        store.update_intake(job, {"size": 3})

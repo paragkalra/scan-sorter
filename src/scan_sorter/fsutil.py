@@ -11,6 +11,7 @@ import errno
 import fcntl
 import hashlib
 import os
+import signal
 import stat
 from dataclasses import dataclass
 
@@ -110,26 +111,62 @@ def open_regular(name: str | bytes, dir_fd: int) -> int:
     return fd
 
 
-def has_writers(name: str | bytes, dir_fd: int) -> bool | None:
-    """Ask the kernel whether any process (in any container) has the file open
-    for writing, by trying to take and immediately drop a read lease.
+class WriterActiveError(Exception):
+    """Some process has the file open for writing."""
 
-    Returns None when the answer is unavailable (leases need the caller to own
-    the file, or CAP_LEASE; some filesystems refuse them).
+
+class LeaseUnavailableError(OSError):
+    """Read leases are not possible here (caller does not own the file, or the
+    filesystem refuses them)."""
+
+
+class ReadLease:
+    """Holds a kernel read lease on an open (read-only) file descriptor.
+
+    Granting it proves no process, in any container, has the file open for
+    writing. While held, any process opening the file for writing is made to
+    wait, and intact() turns False, until release. The holder must ignore
+    SIGIO (see ignore_lease_signals): the kernel sends it on a lease break and
+    its default action terminates the process.
     """
+
+    def __init__(self, fd: int):
+        self.fd = fd
+        try:
+            fcntl.fcntl(fd, fcntl.F_SETLEASE, fcntl.F_RDLCK)
+        except OSError as exc:
+            if exc.errno == errno.EAGAIN:
+                raise WriterActiveError from None
+            raise LeaseUnavailableError(exc.errno, "read lease unavailable") from None
+
+    def intact(self) -> bool:
+        """False once a writer has tried to open the file since the lease was taken."""
+        return fcntl.fcntl(self.fd, fcntl.F_GETLEASE) == fcntl.F_RDLCK
+
+    def release(self) -> None:
+        fcntl.fcntl(self.fd, fcntl.F_SETLEASE, fcntl.F_UNLCK)
+
+    def __enter__(self) -> ReadLease:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.release()
+
+
+def ignore_lease_signals() -> None:
+    """Make lease-break notifications harmless. Must run in the main thread."""
+    if signal.getsignal(signal.SIGIO) is not signal.SIG_IGN:
+        signal.signal(signal.SIGIO, signal.SIG_IGN)
+
+
+def has_writers(name: str | bytes, dir_fd: int) -> bool:
+    """Whether any process has the file open for writing (a quick probe)."""
+    fd = open_regular(name, dir_fd)
     try:
-        fd = open_regular(name, dir_fd)
-    except OSError:
-        return None
-    try:
-        fcntl.fcntl(fd, fcntl.F_SETLEASE, fcntl.F_RDLCK)
-    except OSError as exc:
-        if exc.errno == errno.EAGAIN:
-            return True
-        return None
-    else:
-        fcntl.fcntl(fd, fcntl.F_SETLEASE, fcntl.F_UNLCK)
-        return False
+        with ReadLease(fd):
+            return False
+    except WriterActiveError:
+        return True
     finally:
         os.close(fd)
 

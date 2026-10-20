@@ -464,6 +464,21 @@ class JobStore:
             updated = self._cas(db, job, source_hash=source_hash)
         return updated
 
+    def update_intake(self, job: Job, intake: Mapping[str, Any]) -> Job:
+        """Re-record where a not-yet-adopted input is (it grew before adoption)."""
+        if job.state is not State.RECEIVED or job.source_hash is not None:
+            raise TransitionError("intake can only change before the input is adopted")
+        now = self._clock()
+        with self._write() as db:
+            updated = self._cas(db, job)
+            db.execute(
+                "INSERT INTO stage_results (doc_id, stage, data, recorded_at) VALUES (?,?,?,?)"
+                " ON CONFLICT(doc_id, stage) DO UPDATE"
+                " SET data=excluded.data, recorded_at=excluded.recorded_at",
+                (job.doc_id, Stage.INTAKE.value, json.dumps(intake, sort_keys=True), now),
+            )
+        return updated
+
     def set_output_hash(self, job: Job, output_hash: str) -> Job:
         _check_sha256(output_hash)
         if job.state is not State.CLASSIFIED:

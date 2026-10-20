@@ -293,8 +293,11 @@ def test_hardlinked_input_is_quarantined(dirs, spool, store):
     assert (job.state, last_code(store, job)) == (State.QUARANTINED, "multiple_links")
 
 
-def test_source_changing_during_the_copy_is_quarantined(dirs, spool, store, monkeypatch):
+def test_source_changing_during_the_copy_is_quarantined(dirs, store, monkeypatch):
+    # The fallback guard when leases are off; with leases, a writer in another
+    # process is covered by test_writer_arriving_during_the_copy_...
     inbox, spool_dir = dirs
+    spool = Spool(*dirs, require_no_writers=False)
     write(inbox / "scan.pdf", b"part one")
     real_pread = os.pread
 
@@ -310,7 +313,10 @@ def test_source_changing_during_the_copy_is_quarantined(dirs, spool, store, monk
         return data
 
     monkeypatch.setattr(fsutil.os, "pread", pread_while_writer_appends)
-    job = spool.adopt(store, "scan.pdf", spool.inbox_entries()["scan.pdf"])
+    try:
+        job = spool.adopt(store, "scan.pdf", spool.inbox_entries()["scan.pdf"])
+    finally:
+        spool.close()
     assert (job.state, last_code(store, job)) == (State.QUARANTINED, "changed_during_adoption")
     assert ORIGINAL not in os.listdir(gen_dir(spool_dir, job.doc_id))
 
@@ -493,11 +499,23 @@ def test_reconcile_does_not_take_a_different_file_with_the_same_name(dirs, spool
     inbox, _ = dirs
     st = write(inbox / "scan.pdf", b"first")
     job = _registered(store, "scan.pdf", st)
-    (inbox / "scan.pdf").unlink()
+    os.rename(inbox / "scan.pdf", inbox / "keep.pdf")  # keeps the inode busy
     write(inbox / "scan.pdf", b"second scan, same name")
     spool.reconcile(store)
     assert store.get(job.doc_id).failure_code == "source_missing"
     assert (inbox / "scan.pdf").read_bytes() == b"second scan, same name"
+
+
+def test_reconcile_adopts_a_registered_file_that_grew_before_the_move(dirs, spool, store):
+    inbox, spool_dir = dirs
+    st = write(inbox / "scan.pdf", b"page one")
+    job = _registered(store, "scan.pdf", st)
+    with open(inbox / "scan.pdf", "ab") as f:
+        f.write(b" page two")
+    spool.reconcile(store)
+    job = store.get(job.doc_id)
+    assert job.source_hash == sha(b"page one page two")
+    assert Identity.from_dict(store.stage_result(job.doc_id, Stage.INTAKE)).size == 17
 
 
 def test_reconcile_moves_a_replacement_into_its_own_generation(dirs, spool, store):
@@ -1130,3 +1148,66 @@ def test_open_upload_renamed_between_polls_keeps_its_writer(dirs, spool, store, 
     adopted = w.poll_once().adopted
     assert [original(spool_dir, d).read_bytes() for d in adopted] == [b"page one page two"]
     w.close()
+
+
+def test_spool_ignores_lease_break_signals(dirs):
+    import signal
+
+    with Spool(*dirs):
+        assert signal.getsignal(signal.SIGIO) is signal.SIG_IGN
+
+
+def test_writer_reopening_during_registration_defers_the_job(dirs, spool, store, clock):
+    inbox, spool_dir = dirs
+    w = make_watcher(store, spool, clock, use_inotify=False)
+    write(inbox / "scan.pdf", b"page one")
+    w.poll_once()
+    clock.t += 60
+    real_create = store.create
+    handles = []
+
+    def create_while_writer_reopens(*a, **k):
+        handles.append(open(inbox / "scan.pdf", "ab"))  # noqa: SIM115
+        return real_create(*a, **k)
+
+    store.create = create_while_writer_reopens
+    assert w.poll_once().adopted == []
+    store.create = real_create
+    [job] = store.jobs_in(State.RECEIVED)
+    assert job.source_hash is None
+    assert os.listdir(inbox) == ["scan.pdf"]  # untouched while the writer is open
+    handles[0].write(b" page two")
+    handles[0].close()
+    w.poll_once()
+    job = store.get(job.doc_id)
+    assert original(spool_dir, job.doc_id).read_bytes() == b"page one page two"
+    assert job.source_hash == sha(b"page one page two")
+
+
+def test_writer_arriving_during_the_copy_quarantines_without_killing_us(
+    dirs, spool, store, monkeypatch
+):
+    import subprocess
+    import sys
+    import time
+
+    inbox, spool_dir = dirs
+    write(inbox / "scan.pdf", b"page one")
+    real_copy = fsutil.private_copy
+    children = []
+
+    def copy_while_a_writer_opens(src_fd, dst, dir_fd, **kw):
+        incoming = os.readlink(f"/proc/self/fd/{dir_fd}") + "/" + INCOMING
+        children.append(
+            subprocess.Popen(  # noqa: S603  (test-only, fixed argv)
+                [sys.executable, "-c", f"open({incoming!r}, 'ab').write(b' late')"]
+            )
+        )
+        time.sleep(0.5)  # the child's open is now blocked on our lease
+        return real_copy(src_fd, dst, dir_fd, **kw)
+
+    monkeypatch.setattr(ingest.fsutil, "private_copy", copy_while_a_writer_opens)
+    job = spool.adopt(store, "scan.pdf", spool.inbox_entries()["scan.pdf"])
+    assert children[0].wait(timeout=30) == 0  # released, the writer got through
+    assert (job.state, last_code(store, job)) == (State.QUARANTINED, "writer_during_adoption")
+    assert ORIGINAL not in os.listdir(gen_dir(spool_dir, job.doc_id))
