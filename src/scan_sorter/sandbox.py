@@ -18,7 +18,7 @@ import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from scan_sorter import landlock
+from scan_sorter import landlock, seccomp
 
 
 @dataclass(frozen=True)
@@ -57,9 +57,11 @@ def _limit(limits: Limits, isolate: bool):
         # Exceeding RLIMIT_FSIZE raises SIGXFSZ; make it an EFBIG error instead.
         signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
         if isolate:
-            # No writes, truncation, deletion or TCP anywhere: a compromised
-            # parser cannot touch the spool, the database or the network.
+            # No writes, truncation, deletion or TCP anywhere, and no changes
+            # to permissions, ownership, times or xattrs: a compromised parser
+            # cannot touch the spool, the database or the network.
             landlock.deny_writes_and_network()
+            seccomp.deny_metadata_changes()
 
     return apply
 
@@ -81,8 +83,10 @@ def run(
     """
     if isinstance(argv, str):
         raise TypeError("argv must be a sequence, never a shell string")
-    if isolate and landlock.abi_version() < 1:
-        raise SandboxUnavailable("Landlock is required to run parsers")
+    if isolate and (landlock.abi_version() < landlock.MIN_ABI or not seccomp.supported()):
+        raise SandboxUnavailable(
+            f"parsers need Landlock ABI {landlock.MIN_ABI}+ and a supported seccomp arch"
+        )
     base_env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "LC_ALL": "C.UTF-8"}
     proc = subprocess.Popen(  # noqa: S603  (structured argv, no shell)
         list(argv),

@@ -475,3 +475,81 @@ def test_resuming_a_failed_original_at_the_queue_limit(tmp_path):
         assert dup.state is State.DISCARDED
         assert store.get(first.doc_id).state is State.RECEIVED
         assert store.count_active() == 1
+
+
+# -- round 2 regressions ----------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        "os.chmod(p, 0)",
+        "os.chown(p, os.getuid(), os.getgid())",
+        "os.utime(p, (0, 0))",
+        "os.setxattr(p, 'user.x', b'1')",
+    ],
+)
+def test_sandbox_child_cannot_change_file_metadata(tmp_path, call):
+    path = tmp_path / "original"
+    path.write_bytes(b"x")
+    before = os.stat(path)
+    r = sandbox.run([sys.executable, "-c", f"import os; p = {str(path)!r}; {call}"])
+    assert r.returncode != 0
+    after = os.stat(path)
+    assert (after.st_mode, after.st_mtime_ns) == (before.st_mode, before.st_mtime_ns)
+
+
+def test_sandbox_child_cannot_truncate_with_o_trunc(tmp_path):
+    path = tmp_path / "original"
+    path.write_bytes(b"precious")
+    code = f"import os; os.open({str(path)!r}, os.O_RDONLY | os.O_TRUNC)"
+    assert sandbox.run([sys.executable, "-c", code]).returncode != 0
+    assert path.read_bytes() == b"precious"
+
+
+def test_sandbox_needs_a_landlock_abi_that_stops_truncation(monkeypatch):
+    monkeypatch.setattr(sandbox.landlock, "abi_version", lambda: 2)
+    with pytest.raises(sandbox.SandboxUnavailable):
+        sandbox.run([sys.executable, "-c", "pass"])
+
+
+def test_delayed_adoption_of_the_older_copy_defers_to_the_validated_one(env, tmp_path):
+    _, spool, store = env
+    data = pdf_bytes(tmp_path)
+    older = store.create("a.pdf")  # registered first, adopted later
+    newer = validate.validate(store, spool, adopt(env, "b.pdf", data))
+    assert newer.state is State.VALIDATED
+    inbox, _, _ = env
+    (inbox / "a.pdf").write_bytes(data)
+    older = adopt(env, "a.pdf", data)  # a fresh job stands in for the delayed one
+    older = store.get(older.doc_id)
+    # Force the "older" job to sort first by creation time.
+    store._db.execute("UPDATE jobs SET created_at=0 WHERE doc_id=?", (older.doc_id,))
+    older = validate.validate(store, spool, store.get(older.doc_id))
+    assert older.state is State.DISCARDED
+    assert store.history(older.doc_id)[-1][2] == f"duplicate_of_{newer.doc_id}"
+
+
+def test_supersede_is_all_or_nothing(env, tmp_path):
+    from scan_sorter.jobs import StaleJobError
+
+    _, spool, store = env
+    data = pdf_bytes(tmp_path)
+    original = store.fail(adopt(env, "a.pdf", data), FailureKind.RETRYABLE, "timeout")
+    dup = adopt(env, "b.pdf", data)
+    stale_original = original
+    store.retry(original)  # someone else retried it meanwhile
+    with pytest.raises(StaleJobError):
+        store.supersede(dup, stale_original, f"duplicate_of_{original.doc_id}")
+    assert store.get(dup.doc_id).state is State.RECEIVED  # rolled back
+
+
+def test_supersede_retries_the_original_in_the_same_transaction(env, tmp_path):
+    _, _, store = env
+    data = pdf_bytes(tmp_path)
+    original = store.fail(adopt(env, "a.pdf", data), FailureKind.RETRYABLE, "timeout")
+    dup = adopt(env, "b.pdf", data)
+    store.supersede(dup, original, f"duplicate_of_{original.doc_id}")
+    commits = [h for h in store.history(original.doc_id)]
+    assert commits[-1] == (State.FAILED, State.RECEIVED, "retry")
+    assert store.get(dup.doc_id).state is State.DISCARDED

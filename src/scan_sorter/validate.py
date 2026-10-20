@@ -19,7 +19,7 @@ from enum import StrEnum
 
 from scan_sorter import sandbox
 from scan_sorter.ingest import Spool
-from scan_sorter.jobs import FailureKind, Job, JobStore, QueueFullError, Stage, State
+from scan_sorter.jobs import Job, JobStore, Stage, State
 
 log = logging.getLogger(__name__)
 
@@ -171,10 +171,11 @@ def inspect(fd: int, limits: ValidationLimits) -> tuple[dict | None, str | None]
 def _duplicate(store: JobStore, job: Job, policy: DuplicatePolicy) -> Job | None:
     """Handle a document seen before. Returns the job if it is done here.
 
-    Of all live jobs with the same bytes, the oldest one not yet filed is the
-    canonical one and carries on; the others are discarded as its duplicates.
-    The choice depends only on (created_at, doc_id), so two validators racing
-    on the same document agree on it and exactly one proceeds.
+    Of all live jobs with the same bytes, one unfiled job is canonical and
+    carries on; the others are discarded as its duplicates. A job already past
+    validation wins (it may be far along); otherwise the oldest by
+    (created_at, doc_id). The choice depends only on stored facts, so
+    validators racing on the same document agree on it.
     """
     if job.source_hash is None:
         return None
@@ -183,9 +184,13 @@ def _duplicate(store: JobStore, job: Job, policy: DuplicatePolicy) -> Job | None
         for o in store.find_by_source_hash(job.source_hash)
         if o.state is not State.DISCARDED or o.doc_id == job.doc_id
     ]
-    same.sort(key=lambda o: (o.created_at, o.doc_id))
-    filed = [o for o in same if o.state is State.COMPLETE]
-    pending = [o for o in same if o.state is not State.COMPLETE]
+    filed = sorted(
+        (o for o in same if o.state is State.COMPLETE), key=lambda o: (o.created_at, o.doc_id)
+    )
+    pending = sorted(
+        (o for o in same if o.state is not State.COMPLETE),
+        key=lambda o: (o.state is State.RECEIVED, o.created_at, o.doc_id),
+    )
     if filed and policy is DuplicatePolicy.SKIP:
         canonical = filed[0]
     elif pending[0].doc_id == job.doc_id:
@@ -193,14 +198,7 @@ def _duplicate(store: JobStore, job: Job, policy: DuplicatePolicy) -> Job | None
     else:
         canonical = pending[0]
     log.info("job %s is a duplicate of %s", job.doc_id, canonical.doc_id)
-    done = store.advance(job, State.DISCARDED, code=f"duplicate_of_{canonical.doc_id}")
-    # Discarding first frees this job's queue slot for the one it defers to.
-    if canonical.state is State.FAILED and canonical.failure_kind is FailureKind.RETRYABLE:
-        try:
-            store.retry(canonical)
-        except QueueFullError:
-            pass  # still listed as a retryable failure for a person to retry
-    return done
+    return store.supersede(job, canonical, f"duplicate_of_{canonical.doc_id}")
 
 
 def validate(

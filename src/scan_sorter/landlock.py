@@ -55,12 +55,17 @@ def abi_version() -> int:
     return max(v, 0)
 
 
+# ABI 3 is the first that can stop truncation (open with O_TRUNC); below it
+# a parser could empty any file it can reach, so we refuse to rely on it.
+MIN_ABI = 3
+
+
 def deny_writes_and_network() -> None:
     """Restrict the calling process (and its future children) for good."""
     libc = _libc()
     abi = abi_version()
-    if abi < 1:
-        raise LandlockUnavailable(ctypes.get_errno(), "Landlock is not available")
+    if abi < MIN_ABI:
+        raise LandlockUnavailable(0, f"Landlock ABI {abi} is too old (need {MIN_ABI})")
     fs = _FS_WRITE_FILE | _FS_REMOVE_DIR | _FS_REMOVE_FILE | _FS_MAKE_ALL
     if abi >= 2:
         fs |= _FS_REFER

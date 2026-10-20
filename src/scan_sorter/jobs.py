@@ -630,6 +630,42 @@ class JobStore:
             self._log(db, job.doc_id, job.state, State.DISCARDED, "discard", now)
         return updated
 
+    def supersede(self, duplicate: Job, original: Job, code: str) -> Job:
+        """Discard a RECEIVED duplicate in favour of `original`, atomically.
+
+        If the original is a retryable failure it is put back where it failed
+        in the same transaction, taking the queue slot the duplicate frees, so
+        a crash can never leave both the duplicate discarded and the original
+        stuck. Raises StaleJobError (nothing changed) if either job moved.
+        """
+        if duplicate.state is not State.RECEIVED:
+            raise TransitionError("only a RECEIVED job can be superseded")
+        _check_code(code)
+        now = self._clock()
+        with self._write() as db:
+            discarded = self._cas(db, duplicate, state=State.DISCARDED.value)
+            self._log(db, duplicate.doc_id, State.RECEIVED, State.DISCARDED, code, now)
+            if (
+                original.state is State.FAILED
+                and original.failure_kind is FailureKind.RETRYABLE
+                and original.failed_from is not None
+            ):
+                try:
+                    self._check_capacity(db)
+                except QueueFullError:
+                    pass  # stays a retryable failure; the duplicate still goes
+                else:
+                    self._cas(
+                        db,
+                        original,
+                        state=original.failed_from.value,
+                        failure_kind=None,
+                        failure_code=None,
+                        failed_from=None,
+                    )
+                    self._log(db, original.doc_id, State.FAILED, original.failed_from, "retry", now)
+        return discarded
+
     def replace(
         self, job: Job, source_name: str, *, intake: Mapping[str, Any] | None = None
     ) -> Job:
