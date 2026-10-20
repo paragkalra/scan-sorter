@@ -450,7 +450,13 @@ def test_recovery_redoes_durability_barriers_before_the_hash(dirs, spool, store,
     store.set_source_hash = set_source_hash
     spool.reconcile(store)
     before_hash = events[: events.index("HASH")]
-    for needed in (str(g / ORIGINAL), str(g), str(spool_dir / "jobs"), str(inbox)):
+    for needed in (
+        str(g / ORIGINAL),
+        str(g),
+        str(g.parent),
+        str(spool_dir / "jobs"),
+        str(inbox),
+    ):
         assert needed in before_hash, needed
 
 
@@ -751,3 +757,142 @@ def test_run_reconciles_first_and_stops(dirs, spool, store, clock):
     stop.set()
     make_watcher(store, spool, clock, use_inotify=False).run(stop, interval=0)
     assert store.get(job.doc_id).source_hash is not None
+
+
+def test_gate_later_event_cancels_an_earlier_close():
+    clock = Clock()
+    gate = started_gate(clock)
+    gate.observe({"a": ident()}, {"a": True}, events_reliable=True)
+    gate.observe({"a": ident()}, {"a": False}, events_reliable=True)
+    clock.t += 100
+    assert gate.observe({"a": ident()}, events_reliable=True).ready == []
+
+
+def test_inotify_reports_the_latest_event_per_name(dirs, spool):
+    from scan_sorter.inotify import try_inotify
+
+    inbox, _ = dirs
+    ino = try_inotify(spool.inbox_fd)
+    if ino is None:
+        pytest.skip("inotify unavailable")
+    try:
+        write(inbox / "a.pdf")  # created, written, closed
+        (inbox / "a.pdf").unlink()
+        handle = open(inbox / "a.pdf", "wb")  # noqa: SIM115
+        handle.write(b"still writing")
+        handle.flush()
+        write(inbox / "b.pdf")
+        assert ino.read() == {b"a.pdf": False, b"b.pdf": True}
+        handle.close()
+        assert ino.read() == {b"a.pdf": True}
+    finally:
+        ino.close()
+
+
+def test_close_of_a_deleted_file_does_not_certify_its_replacement(dirs, spool, store, clock):
+    inbox, spool_dir = dirs
+    w = make_watcher(store, spool, clock)
+    if w.inotify is None:
+        pytest.skip("inotify unavailable")
+    w.poll_once()
+    write(inbox / "scan.pdf", b"first, finished")
+    (inbox / "scan.pdf").unlink()
+    with open(inbox / "scan.pdf", "wb") as f:
+        f.write(b"second, still being written")
+        f.flush()
+        w.poll_once()
+        clock.t += 120
+        assert w.poll_once().adopted == []
+        f.write(b" and the last page")
+    w.poll_once()
+    clock.t += 10
+    adopted = w.poll_once().adopted
+    assert len(adopted) == 1
+    assert original(spool_dir, adopted[0]).read_bytes().endswith(b"the last page")
+    w.close()
+
+
+def test_source_bytes_are_synced_before_leaving_the_inbox(dirs, spool, store, monkeypatch):
+    inbox, _ = dirs
+    st = write(inbox / "slow.pdf", b"partial")
+    events = []
+    real_fsync, real_rename = os.fsync, os.rename
+
+    def fsync(fd):
+        events.append(("fsync", os.readlink(f"/proc/self/fd/{fd}")))
+        real_fsync(fd)
+
+    def rename(src, dst, **kw):
+        events.append(("rename", src))
+        real_rename(src, dst, **kw)
+
+    monkeypatch.setattr(fsutil.os, "fsync", fsync)
+    monkeypatch.setattr(ingest.os, "rename", rename)
+    spool.adopt(store, "slow.pdf", st, quarantine_code="incomplete_transfer")
+    assert events.index(("fsync", str(inbox / "slow.pdf"))) < events.index(("rename", "slow.pdf"))
+
+
+def test_adoption_cut_by_a_transient_error_resumes_on_the_next_poll(
+    dirs, tmp_path, clock, monkeypatch
+):
+    import errno as errno_mod
+
+    inbox, spool_dir = dirs
+    with Spool(inbox, spool_dir) as spool, JobStore(tmp_path / "q.sqlite", max_active=1) as store:
+        w = make_watcher(store, spool, clock, use_inotify=False)
+        write(inbox / "a.pdf", b"aaa")
+        w.poll_once()
+        clock.t += 60
+        real_copy = fsutil.private_copy
+        calls = []
+
+        def copy_fails_once(*a, **k):
+            calls.append(1)
+            if len(calls) == 1:
+                raise OSError(errno_mod.ENOSPC, "No space left on device")
+            return real_copy(*a, **k)
+
+        monkeypatch.setattr(ingest.fsutil, "private_copy", copy_fails_once)
+        report = w.poll_once()
+        assert report.adopted == []
+        [job] = store.jobs_in(State.RECEIVED)
+        assert job.source_hash is None
+        write(inbox / "b.pdf", b"bbb")
+        w.poll_once()  # resumes a.pdf first
+        assert store.get(job.doc_id).source_hash == sha(b"aaa")
+        clock.t += 60
+        store.fail(store.get(job.doc_id), FailureKind.PERMANENT, "done")
+        assert len(w.poll_once().adopted) == 1  # the queue is not stuck
+
+
+def test_interrupted_orphan_recovery_can_be_resumed(dirs, spool, store, monkeypatch):
+    _, spool_dir = dirs
+    doc_id = "ab" * 16
+    gen_dir(spool_dir, doc_id).mkdir(parents=True)
+    original(spool_dir, doc_id).write_bytes(b"orphan")
+    real_hash = fsutil.sha256_file
+
+    def hash_fails(*a, **k):
+        raise OSError(5, "I/O error")
+
+    monkeypatch.setattr(ingest.fsutil, "sha256_file", hash_fails)
+    with pytest.raises(OSError):
+        spool.reconcile(store)
+    monkeypatch.setattr(ingest.fsutil, "sha256_file", real_hash)
+    spool.reconcile(store)
+    assert store.get(doc_id).source_hash == sha(b"orphan")
+
+
+def test_files_discovered_during_an_overflow_use_the_fallback(dirs, spool, store, clock):
+    inbox, _ = dirs
+    w = make_watcher(store, spool, clock)
+    if w.inotify is None:
+        pytest.skip("inotify unavailable")
+    w.poll_once()
+    write(inbox / "scan.pdf")
+    w.inotify.read()  # its close event is lost in the overflow
+    w.inotify.overflowed = True
+    w.poll_once()
+    clock.t += 60
+    assert len(w.poll_once().adopted) == 1
+    w.close()

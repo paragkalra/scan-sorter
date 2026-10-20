@@ -109,10 +109,15 @@ class TransferGate:
     def observe(
         self,
         entries: Mapping[str, Identity],
-        closed: Iterable[str] = (),
+        finished: Mapping[str, bool] | Iterable[str] = (),
         *,
         events_reliable: bool = False,
     ) -> GateResult:
+        """`finished` maps names to whether their latest inotify event (since the
+        previous call) was a close-after-write or move-in; a plain iterable of
+        names means all finished."""
+        if not isinstance(finished, Mapping):
+            finished = dict.fromkeys(finished, True)
         now = self._clock()
         # Files present at the very first scan arrived while nobody watched.
         watching = events_reliable and self._started
@@ -126,11 +131,12 @@ class TransferGate:
                 self._seen[name] = _Seen(ident, now, now, needs_close=watching)
             elif seen.ident != ident:
                 seen.ident, seen.last_change, seen.closed = ident, now, False
-        # Close events are applied after the scan: a close reported now covers
-        # the state we just observed.
-        for name in closed:
+        # Events are applied after the scan, latest event per name wins: a
+        # close reported now covers the state we just observed, while a later
+        # create or write under the same name cancels an earlier close.
+        for name, done in finished.items():
             if name in self._seen:
-                self._seen[name].closed = True
+                self._seen[name].closed = done
         ready, overdue = [], []
         for name, seen in self._seen.items():
             quiet = now - seen.last_change
@@ -268,20 +274,23 @@ class Spool:
             ignore_capacity=ignore_capacity,
         )
         log.info("job %s received", job.doc_id)
-        return self._resume(store, job)
+        return self.resume(store, job)
 
-    def _resume(self, store: JobStore, job: Job) -> Job:
+    def resume(self, store: JobStore, job: Job) -> Job:
         """Carry a RECEIVED job without a hash through whatever steps remain."""
         intake = store.stage_result(job.doc_id, Stage.INTAKE)
         if intake is None:
             return store.fail(job, FailureKind.PERMANENT, "source_missing")
         gen = intake.get("gen", 0)
-        expected = Identity.from_dict(intake)
+        # Recovered orphans have no inbox identity: only a finished copy counts.
+        expected = Identity.from_dict(intake) if "dev" in intake else None
         quarantine = intake.get("quarantine")
         gen_fd = self.open_input_dir(job.doc_id, gen, create=True)
         try:
             have_original = fsutil.lstat_at(ORIGINAL, gen_fd) is not None
             have_incoming = fsutil.lstat_at(INCOMING, gen_fd) is not None
+            if expected is None and not have_original:
+                return store.fail(job, FailureKind.PERMANENT, "source_missing")
             if not have_original and not have_incoming:
                 try:
                     self._take_from_inbox(intake, expected, quarantine, gen_fd)
@@ -307,6 +316,14 @@ class Spool:
             current.same_file(expected) if quarantine else current.same_content(expected)
         ):
             raise SourceMissingError(name)
+        if current.is_regular:
+            # The printer's bytes must be durable before the entry leaves the
+            # inbox durably; quarantined files are never copied, so this is
+            # their only barrier.
+            try:
+                fsutil.fsync_file(name, self.inbox_fd)
+            except FileNotFoundError:
+                raise SourceMissingError(name) from None
         try:
             os.rename(name, INCOMING, src_dir_fd=self.inbox_fd, dst_dir_fd=gen_fd)
         except FileNotFoundError:
@@ -357,6 +374,11 @@ class Spool:
         # may have died before its own fsyncs.
         fsutil.fsync_file(ORIGINAL, gen_fd)
         os.fsync(gen_fd)
+        job_fd = fsutil.open_dir(job.doc_id, dir_fd=self.jobs_fd)
+        try:
+            os.fsync(job_fd)
+        finally:
+            os.close(job_fd)
         os.fsync(self.jobs_fd)
         os.fsync(self.inbox_fd)
         job = store.set_source_hash(job, fsutil.sha256_file(ORIGINAL, gen_fd))
@@ -371,7 +393,7 @@ class Spool:
         for job in store.jobs_in(State.RECEIVED):
             if job.source_hash is None:
                 touched.append(job.doc_id)
-                self._resume(store, job)
+                self.resume(store, job)
         touched += self._adopt_orphan_dirs(store)
         return touched
 
@@ -462,15 +484,18 @@ class Watcher:
 
     def poll_once(self) -> PollReport:
         report = PollReport()
-        closed: list[str] = []
+        finished: dict[str, bool] = {}
+        reliable = self.inotify is not None
         if self.inotify is not None:
-            closed = [os.fsdecode(n) for n in self.inotify.read()]
+            finished = {os.fsdecode(n): done for n, done in self.inotify.read().items()}
             if self.inotify.overflowed:
+                # Events were lost: nothing seen this poll can rely on them.
                 self.gate.forget_closed()
                 self.inotify.overflowed = False
-                closed = []
+                finished, reliable = {}, False
+        self._resume_pending(report)
         entries = self.spool.inbox_entries()
-        result = self.gate.observe(entries, closed, events_reliable=self.inotify is not None)
+        result = self.gate.observe(entries, finished, events_reliable=reliable)
         # Overdue files are quarantined straight away, so they never take a
         # queue slot; they still need disk for the move's metadata.
         work = [(n, "incomplete_transfer") for n in result.overdue]
@@ -506,6 +531,18 @@ class Watcher:
             # Files stay in the inbox and are picked up on a later poll.
             log.info("intake paused: %s", report.paused)
         return report
+
+    def _resume_pending(self, report: PollReport) -> None:
+        """Retry adoptions that a transient error (e.g. a full disk) cut short."""
+        if not disk_has_room(self.spool.spool_path, self.min_free_bytes, self.disk_usage):
+            return
+        for job in self.store.jobs_in(State.RECEIVED):
+            if job.source_hash is not None:
+                continue
+            try:
+                self.spool.resume(self.store, job)
+            except OSError as exc:
+                log.warning("resume error %s", errno.errorcode.get(exc.errno, "unknown"))
 
     def run(self, stop: threading.Event, *, interval: float = 2.0) -> None:
         self.spool.reconcile(self.store)

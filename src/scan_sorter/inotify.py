@@ -12,8 +12,15 @@ import errno
 import os
 import struct
 
+IN_MODIFY = 0x00000002
 IN_CLOSE_WRITE = 0x00000008
+IN_MOVED_FROM = 0x00000040
 IN_MOVED_TO = 0x00000080
+IN_CREATE = 0x00000100
+IN_DELETE = 0x00000200
+WATCH_MASK = IN_MODIFY | IN_CLOSE_WRITE | IN_MOVED_FROM | IN_MOVED_TO | IN_CREATE | IN_DELETE
+# A name is "finished" when its latest event is one of these.
+FINISHED = IN_CLOSE_WRITE | IN_MOVED_TO
 IN_Q_OVERFLOW = 0x00004000
 IN_NONBLOCK = 0o4000
 IN_CLOEXEC = 0o2000000
@@ -22,7 +29,9 @@ _HEADER = struct.Struct("iIII")
 
 
 class Inotify:
-    """Watches one directory for files that finished being written or moved in."""
+    """Watches one directory and reports, per name, whether its latest event
+    says the file is finished (closed after writing, or moved in) or not
+    (created, written to, deleted, moved away)."""
 
     def __init__(self, dir_fd: int):
         libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno=True)
@@ -32,7 +41,7 @@ class Inotify:
         self._fd = fd
         # Watch the directory we already hold open, never a re-resolved path.
         path = f"/proc/self/fd/{dir_fd}".encode()
-        wd = libc.inotify_add_watch(fd, path, IN_CLOSE_WRITE | IN_MOVED_TO)
+        wd = libc.inotify_add_watch(fd, path, WATCH_MASK)
         if wd < 0:
             err = ctypes.get_errno()
             os.close(fd)
@@ -42,9 +51,13 @@ class Inotify:
     def fileno(self) -> int:
         return self._fd
 
-    def read(self) -> list[bytes]:
-        """Names closed-after-write or moved into the directory since the last read."""
-        names: list[bytes] = []
+    def read(self) -> dict[bytes, bool]:
+        """For each name with events since the last read: is its latest event a finish?
+
+        Order matters: a close of an old file followed by the creation of a
+        new one under the same name leaves that name unfinished.
+        """
+        names: dict[bytes, bool] = {}
         while True:
             try:
                 buf = os.read(self._fd, 64 * 1024)
@@ -62,8 +75,8 @@ class Inotify:
                 pos += length
                 if mask & IN_Q_OVERFLOW:
                     self.overflowed = True
-                elif name:
-                    names.append(name)
+                elif name and mask & WATCH_MASK:
+                    names[name] = bool(mask & FINISHED)
 
     def close(self) -> None:
         os.close(self._fd)
