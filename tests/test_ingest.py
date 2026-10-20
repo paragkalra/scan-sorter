@@ -1274,3 +1274,22 @@ def test_startup_recovery_waits_when_disk_is_low(dirs, spool, store, clock):
     make_watcher(store, spool, clock, use_inotify=False, disk_usage=NO_DISK).run(stop, interval=0)
     assert store.get(job.doc_id).source_hash is None
     assert os.listdir(inbox) == ["scan.pdf"]
+
+
+def test_orphan_recovery_skipped_for_low_disk_runs_once_space_returns(dirs, spool, store, clock):
+    _, spool_dir = dirs
+    doc_id = "34" * 16
+    gen_dir(spool_dir, doc_id).mkdir(parents=True)
+    original(spool_dir, doc_id).write_bytes(b"sole surviving copy")
+    free = [0]
+    w = make_watcher(
+        store, spool, clock, use_inotify=False, disk_usage=lambda _p: Usage(0, 0, free[0])
+    )
+    stop = threading.Event()
+    stop.set()
+    w.run(stop, interval=0)
+    w.poll_once()
+    assert store.jobs_in(*State) == []
+    free[0] = 1 << 40
+    w.poll_once()
+    assert store.get(doc_id).source_hash == sha(b"sole surviving copy")

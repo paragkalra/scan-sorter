@@ -692,6 +692,9 @@ class Watcher:
         self.min_free_bytes = min_free_bytes
         self.disk_usage = disk_usage
         self.inotify = try_inotify(spool.inbox_fd) if use_inotify else None
+        # Full startup recovery (including orphan spool directories) runs on
+        # the first poll that has the disk for it and completes without error.
+        self._recovered = False
 
     def close(self) -> None:
         if self.inotify is not None:
@@ -708,6 +711,7 @@ class Watcher:
                 self.gate.forget_closed()
                 self.inotify.overflowed = False
                 events, reliable = [], False
+        self._recover_once()
         self._resume_pending(report)
         entries = self.spool.inbox_entries()
         result = self.gate.observe(entries, events, events_reliable=reliable)
@@ -748,6 +752,18 @@ class Watcher:
             log.info("intake paused: %s", report.paused)
         return report
 
+    def _recover_once(self) -> None:
+        if self._recovered:
+            return
+        if not disk_has_room(self.spool.spool_path, self.min_free_bytes, self.disk_usage):
+            return
+        try:
+            self.spool.reconcile(self.store)
+        except OSError as exc:
+            log.warning("recovery error %s", errno.errorcode.get(exc.errno, "unknown"))
+            return
+        self._recovered = True
+
     def _resume_pending(self, report: PollReport) -> None:
         """Retry adoptions that a transient error (e.g. a full disk) cut short."""
         if not disk_has_room(self.spool.spool_path, self.min_free_bytes, self.disk_usage):
@@ -761,13 +777,9 @@ class Watcher:
                 log.warning("resume error %s", errno.errorcode.get(exc.errno, "unknown"))
 
     def run(self, stop: threading.Event, *, interval: float = 2.0) -> None:
-        # Recovery needs disk like any adoption; without it, polling retries
-        # the unfinished jobs once space is back.
-        if disk_has_room(self.spool.spool_path, self.min_free_bytes, self.disk_usage):
-            try:
-                self.spool.reconcile(self.store)
-            except OSError as exc:
-                log.warning("recovery error %s", errno.errorcode.get(exc.errno, "unknown"))
+        # Recovery needs disk like any adoption; until it has run, every poll
+        # tries it again first.
+        self._recover_once()
         while not stop.is_set():
             self.poll_once()
             if self.inotify is not None:
