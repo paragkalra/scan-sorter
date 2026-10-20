@@ -553,3 +553,65 @@ def test_supersede_retries_the_original_in_the_same_transaction(env, tmp_path):
     commits = [h for h in store.history(original.doc_id)]
     assert commits[-1] == (State.FAILED, State.RECEIVED, "retry")
     assert store.get(dup.doc_id).state is State.DISCARDED
+
+
+# -- round 3 regressions ----------------------------------------------------------------
+
+
+def test_copy_published_during_inspection_wins_and_the_other_gives_way(env, tmp_path, monkeypatch):
+    inbox, spool, store = env
+    data = pdf_bytes(tmp_path)
+    older = adopt(env, "a.pdf", data)
+    newer = adopt(env, "b.pdf", data)
+    store._db.execute(  # make "older" sort first, then hide its hash (not yet published)
+        "UPDATE jobs SET created_at=0, source_hash=NULL WHERE doc_id=?", (older.doc_id,)
+    )
+    real_inspect = validate.inspect
+    calls = []
+
+    def inspect_while_older_publishes(fd, limits):
+        if not calls:
+            calls.append(1)
+            store._db.execute(
+                "UPDATE jobs SET source_hash=? WHERE doc_id=?", (newer.source_hash, older.doc_id)
+            )
+            assert validate.validate(store, spool, store.get(older.doc_id)).state is State.VALIDATED
+        return real_inspect(fd, limits)
+
+    monkeypatch.setattr(validate, "inspect", inspect_while_older_publishes)
+    newer = validate.validate(store, spool, store.get(newer.doc_id))
+    assert newer.state is State.DISCARDED
+    assert store.history(newer.doc_id)[-1][2] == f"duplicate_of_{older.doc_id}"
+
+
+def test_canonical_replaced_before_supersede_is_not_deferred_to(env, tmp_path, monkeypatch):
+    _, spool, store = env
+    data = pdf_bytes(tmp_path)
+    first = store.advance(adopt(env, "a.pdf", data), State.QUARANTINED, code="corrupt")
+    dup = adopt(env, "b.pdf", data)
+    real_canonical = store.canonical
+    calls = []
+
+    def canonical_then_replace(*a, **k):
+        winner = real_canonical(*a, **k)
+        if not calls:
+            calls.append(1)
+            store.replace(store.get(first.doc_id), "other.pdf")  # different input now
+        return winner
+
+    monkeypatch.setattr(store, "canonical", canonical_then_replace)
+    dup = validate.validate(store, spool, dup)
+    assert dup.state is State.VALIDATED  # nothing else carries these bytes any more
+
+
+def test_mark_validated_refuses_a_non_canonical_job(env, tmp_path):
+    from scan_sorter.jobs import NotCanonicalError
+
+    _, _, store = env
+    data = pdf_bytes(tmp_path)
+    older = adopt(env, "a.pdf", data)
+    newer = adopt(env, "b.pdf", data)
+    with pytest.raises(NotCanonicalError) as exc:
+        store.mark_validated(newer, {}, skip_filed=True)
+    assert exc.value.canonical.doc_id == older.doc_id
+    assert store.get(newer.doc_id).state is State.RECEIVED

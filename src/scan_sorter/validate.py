@@ -19,7 +19,7 @@ from enum import StrEnum
 
 from scan_sorter import sandbox
 from scan_sorter.ingest import Spool
-from scan_sorter.jobs import Job, JobStore, Stage, State
+from scan_sorter.jobs import Job, JobStore, NotCanonicalError, StaleJobError, State
 
 log = logging.getLogger(__name__)
 
@@ -168,37 +168,14 @@ def inspect(fd: int, limits: ValidationLimits) -> tuple[dict | None, str | None]
     return result, None
 
 
-def _duplicate(store: JobStore, job: Job, policy: DuplicatePolicy) -> Job | None:
-    """Handle a document seen before. Returns the job if it is done here.
-
-    Of all live jobs with the same bytes, one unfiled job is canonical and
-    carries on; the others are discarded as its duplicates. A job already past
-    validation wins (it may be far along); otherwise the oldest by
-    (created_at, doc_id). The choice depends only on stored facts, so
-    validators racing on the same document agree on it.
-    """
-    if job.source_hash is None:
+def _supersede_if_duplicate(
+    store: JobStore, job: Job, policy: DuplicatePolicy, winner: Job | None
+) -> Job | None:
+    """Discard `job` in favour of `winner` unless it is the winner itself."""
+    if winner is None or winner.doc_id == job.doc_id:
         return None
-    same = [
-        o
-        for o in store.find_by_source_hash(job.source_hash)
-        if o.state is not State.DISCARDED or o.doc_id == job.doc_id
-    ]
-    filed = sorted(
-        (o for o in same if o.state is State.COMPLETE), key=lambda o: (o.created_at, o.doc_id)
-    )
-    pending = sorted(
-        (o for o in same if o.state is not State.COMPLETE),
-        key=lambda o: (o.state is State.RECEIVED, o.created_at, o.doc_id),
-    )
-    if filed and policy is DuplicatePolicy.SKIP:
-        canonical = filed[0]
-    elif pending[0].doc_id == job.doc_id:
-        return None  # this job is the one that goes ahead
-    else:
-        canonical = pending[0]
-    log.info("job %s is a duplicate of %s", job.doc_id, canonical.doc_id)
-    return store.supersede(job, canonical, f"duplicate_of_{canonical.doc_id}")
+    log.info("job %s is a duplicate of %s", job.doc_id, winner.doc_id)
+    return store.supersede(job, winner, f"duplicate_of_{winner.doc_id}")
 
 
 def validate(
@@ -208,19 +185,45 @@ def validate(
     *,
     limits: ValidationLimits = DEFAULT_LIMITS,
     duplicates: DuplicatePolicy = DuplicatePolicy.SKIP,
+    attempts: int = 5,
 ) -> Job:
-    """Run the validation stage for one RECEIVED, adopted job."""
+    """Run the validation stage for one RECEIVED, adopted job.
+
+    Of all live jobs with the same bytes, one carries on and the others are
+    discarded as its duplicates (see JobStore._elect). The election is
+    repeated inside the transaction that marks this job validated, so racing
+    validators cannot both go ahead.
+    """
     if job.state is not State.RECEIVED or job.source_hash is None:
         raise ValueError("validation needs an adopted RECEIVED job")
-    done = _duplicate(store, job, duplicates)
-    if done is not None:
-        return done
-    fd = spool.open_original(store, job)
-    try:
-        result, code = inspect(fd, limits)
-    finally:
-        os.close(fd)
-    if code is not None:
-        log.info("job %s quarantined: %s", job.doc_id, code)
-        return store.advance(job, State.QUARANTINED, code=code)
-    return store.advance(job, State.VALIDATED, result=(Stage.VALIDATE, result))
+    skip_filed = duplicates is DuplicatePolicy.SKIP
+    for _ in range(attempts):
+        try:
+            done = _supersede_if_duplicate(
+                store, job, duplicates, store.canonical(job.source_hash, skip_filed=skip_filed)
+            )
+        except StaleJobError:
+            # The job we deferred to changed (e.g. its input was replaced).
+            job = store.get(job.doc_id)
+            if job.state is not State.RECEIVED:
+                return job
+            continue
+        if done is not None:
+            return done
+        fd = spool.open_original(store, job)
+        try:
+            result, code = inspect(fd, limits)
+        finally:
+            os.close(fd)
+        if code is not None:
+            log.info("job %s quarantined: %s", job.doc_id, code)
+            return store.advance(job, State.QUARANTINED, code=code)
+        try:
+            return store.mark_validated(job, result, skip_filed=skip_filed)
+        except NotCanonicalError:
+            continue  # another copy won meanwhile: re-elect and give way to it
+        except StaleJobError:
+            job = store.get(job.doc_id)
+            if job.state is not State.RECEIVED:
+                return job
+    raise RuntimeError(f"job {job.doc_id}: duplicate election did not settle")

@@ -186,6 +186,14 @@ class QueueFullError(Exception):
     pass
 
 
+class NotCanonicalError(Exception):
+    """Another job with the same bytes goes ahead instead of this one."""
+
+    def __init__(self, canonical: Job):
+        super().__init__(canonical.doc_id)
+        self.canonical = canonical
+
+
 class DestinationTakenError(Exception):
     """Another job already reserved this destination path."""
 
@@ -630,6 +638,57 @@ class JobStore:
             self._log(db, job.doc_id, job.state, State.DISCARDED, "discard", now)
         return updated
 
+    @staticmethod
+    def _elect(db: sqlite3.Connection, source_hash: str, *, skip_filed: bool) -> Job | None:
+        """The job that should go ahead for these bytes, or None if there is none.
+
+        A filed (COMPLETE) copy wins when skip_filed. Otherwise among unfiled
+        live jobs: one already past validation first (it may be far along),
+        then the oldest by (created_at, doc_id). Run inside the transaction
+        that acts on the answer, so concurrent validators cannot both win.
+        """
+        rows = db.execute(
+            "SELECT * FROM jobs WHERE source_hash=? AND state != ?",
+            (source_hash, State.DISCARDED.value),
+        ).fetchall()
+        jobs = [Job._from_row(r) for r in rows]
+        filed = sorted(
+            (j for j in jobs if j.state is State.COMPLETE), key=lambda j: (j.created_at, j.doc_id)
+        )
+        if filed and skip_filed:
+            return filed[0]
+        pending = sorted(
+            (j for j in jobs if j.state is not State.COMPLETE),
+            key=lambda j: (j.state is State.RECEIVED, j.created_at, j.doc_id),
+        )
+        return pending[0] if pending else None
+
+    def canonical(self, source_hash: str, *, skip_filed: bool) -> Job | None:
+        return self._elect(self._db, source_hash, skip_filed=skip_filed)
+
+    def mark_validated(self, job: Job, result: Mapping[str, Any], *, skip_filed: bool) -> Job:
+        """RECEIVED -> VALIDATED, only if this job is still the canonical copy.
+
+        Raises NotCanonicalError (nothing changed) when another job with the
+        same bytes should go ahead instead.
+        """
+        if job.state is not State.RECEIVED or job.source_hash is None:
+            raise TransitionError("only an adopted RECEIVED job can be validated")
+        now = self._clock()
+        with self._write() as db:
+            winner = self._elect(db, job.source_hash, skip_filed=skip_filed)
+            if winner is not None and winner.doc_id != job.doc_id:
+                raise NotCanonicalError(winner)
+            updated = self._cas(db, job, state=State.VALIDATED.value)
+            db.execute(
+                "INSERT INTO stage_results (doc_id, stage, data, recorded_at) VALUES (?,?,?,?)"
+                " ON CONFLICT(doc_id, stage) DO UPDATE"
+                " SET data=excluded.data, recorded_at=excluded.recorded_at",
+                (job.doc_id, Stage.VALIDATE.value, json.dumps(result, sort_keys=True), now),
+            )
+            self._log(db, job.doc_id, State.RECEIVED, State.VALIDATED, None, now)
+        return updated
+
     def supersede(self, duplicate: Job, original: Job, code: str) -> Job:
         """Discard a RECEIVED duplicate in favour of `original`, atomically.
 
@@ -643,6 +702,17 @@ class JobStore:
         _check_code(code)
         now = self._clock()
         with self._write() as db:
+            # The original must still be exactly what the caller decided on:
+            # same revision, same bytes, not discarded.
+            row = db.execute("SELECT * FROM jobs WHERE doc_id=?", (original.doc_id,)).fetchone()
+            current = Job._from_row(row) if row else None
+            if (
+                current is None
+                or current.revision != original.revision
+                or current.source_hash != duplicate.source_hash
+                or current.state is State.DISCARDED
+            ):
+                raise StaleJobError(f"job {original.doc_id} changed")
             discarded = self._cas(db, duplicate, state=State.DISCARDED.value)
             self._log(db, duplicate.doc_id, State.RECEIVED, State.DISCARDED, code, now)
             if (
