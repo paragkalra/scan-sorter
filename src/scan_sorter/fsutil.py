@@ -7,6 +7,8 @@ read, rename or fsync outside the directory we opened.
 
 from __future__ import annotations
 
+import errno
+import fcntl
 import hashlib
 import os
 import stat
@@ -106,6 +108,30 @@ def open_regular(name: str | bytes, dir_fd: int) -> int:
         os.close(fd)
         raise
     return fd
+
+
+def has_writers(name: str | bytes, dir_fd: int) -> bool | None:
+    """Ask the kernel whether any process (in any container) has the file open
+    for writing, by trying to take and immediately drop a read lease.
+
+    Returns None when the answer is unavailable (leases need the caller to own
+    the file, or CAP_LEASE; some filesystems refuse them).
+    """
+    try:
+        fd = open_regular(name, dir_fd)
+    except OSError:
+        return None
+    try:
+        fcntl.fcntl(fd, fcntl.F_SETLEASE, fcntl.F_RDLCK)
+    except OSError as exc:
+        if exc.errno == errno.EAGAIN:
+            return True
+        return None
+    else:
+        fcntl.fcntl(fd, fcntl.F_SETLEASE, fcntl.F_UNLCK)
+        return False
+    finally:
+        os.close(fd)
 
 
 def fsync_file(name: str | bytes, dir_fd: int) -> Identity:

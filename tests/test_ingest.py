@@ -242,10 +242,37 @@ def test_adopt_makes_a_private_copy_and_records_hash_and_intake(dirs, spool, sto
     assert Identity.from_dict(intake) == st
 
 
-def test_writer_keeping_its_handle_cannot_change_the_adopted_copy(dirs, spool, store):
+def test_adopt_refuses_a_file_some_process_has_open_for_writing(dirs, spool, store):
+    inbox, _ = dirs
+    write(inbox / "scan.pdf")
+    with open(inbox / "scan.pdf", "ab"):
+        with pytest.raises(ingest.SourceChangedError):
+            spool.adopt(store, "scan.pdf", spool.inbox_entries()["scan.pdf"])
+    assert store.jobs_in(*State) == []
+    assert spool.adopt(store, "scan.pdf", spool.inbox_entries()["scan.pdf"]).source_hash
+
+
+def test_has_writers_sees_every_writable_handle(tmp_path):
+    path = tmp_path / "f"
+    path.write_bytes(b"x")
+    dir_fd = os.open(tmp_path, os.O_RDONLY)
+    try:
+        assert fsutil.has_writers("f", dir_fd) is False
+        a, b = open(path, "ab"), open(path, "ab")  # noqa: SIM115
+        a.close()
+        assert fsutil.has_writers("f", dir_fd) is True  # b is still open
+        b.close()
+        assert fsutil.has_writers("f", dir_fd) is False
+    finally:
+        os.close(dir_fd)
+
+
+def test_writer_keeping_its_handle_cannot_change_the_adopted_copy(dirs, store):
+    # Defence in depth when leases are unavailable: the copy is still private.
     inbox, spool_dir = dirs
     write(inbox / "scan.pdf", b"original bytes")
     handle = open(inbox / "scan.pdf", "r+b")  # noqa: SIM115
+    spool = Spool(*dirs, require_no_writers=False)
     try:
         job = spool.adopt(store, "scan.pdf", spool.inbox_entries()["scan.pdf"])
         handle.seek(0)
@@ -253,6 +280,7 @@ def test_writer_keeping_its_handle_cannot_change_the_adopted_copy(dirs, spool, s
         handle.flush()
     finally:
         handle.close()
+        spool.close()
     assert original(spool_dir, job.doc_id).read_bytes() == b"original bytes"
     assert store.get(job.doc_id).source_hash == sha(b"original bytes")
 
@@ -1058,3 +1086,47 @@ def test_failed_file_fsync_keeps_the_job_resumable(dirs, spool, store, monkeypat
     monkeypatch.undo()
     spool.reconcile(store)
     assert store.get(job.doc_id).state is State.QUARANTINED
+
+
+def test_second_writer_hidden_by_merged_open_events_blocks_adoption(dirs, spool, store, clock):
+    inbox, spool_dir = dirs
+    w = make_watcher(store, spool, clock)
+    if w.inotify is None:
+        pytest.skip("inotify unavailable")
+    w.poll_once()
+    first = open(inbox / "scan.pdf", "wb")  # noqa: SIM115
+    second = open(inbox / "scan.pdf", "ab")  # noqa: SIM115  (its IN_OPEN may merge)
+    first.write(b"page one")
+    first.close()
+    w.poll_once()
+    clock.t += 120
+    assert w.poll_once().adopted == []
+    second.write(b" page two")
+    second.close()
+    w.poll_once()
+    clock.t += 10
+    [doc] = w.poll_once().adopted
+    assert original(spool_dir, doc).read_bytes() == b"page one page two"
+    w.close()
+
+
+def test_open_upload_renamed_between_polls_keeps_its_writer(dirs, spool, store, clock):
+    inbox, spool_dir = dirs
+    w = make_watcher(store, spool, clock)
+    if w.inotify is None:
+        pytest.skip("inotify unavailable")
+    w.poll_once()
+    with open(inbox / "upload.tmp", "wb") as f:
+        f.write(b"page one")
+        f.flush()
+        w.poll_once()  # upload.tmp is listed this poll
+        os.rename(inbox / "upload.tmp", inbox / "scan.pdf")
+        w.poll_once()
+        clock.t += 120
+        assert w.poll_once().adopted == []
+        f.write(b" page two")
+    w.poll_once()
+    clock.t += 10
+    adopted = w.poll_once().adopted
+    assert [original(spool_dir, d).read_bytes() for d in adopted] == [b"page one page two"]
+    w.close()

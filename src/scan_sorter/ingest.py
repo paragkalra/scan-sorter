@@ -159,11 +159,10 @@ class TransferGate:
         for name in list(self._seen):
             if name not in entries:
                 del self._seen[name]
-        # Dotfiles are not entries but their handles matter once renamed in;
-        # drop state for anything that is neither listed nor hidden.
-        for name in list(self._handles):
-            if name not in entries and not name.startswith("."):
-                del self._handles[name]
+        # Handle state is not pruned here: a file listed last poll may have
+        # been renamed since, and its IN_MOVED_FROM (processed below) must
+        # still find it. DELETE and MOVED_FROM remove entries; an overflow
+        # clears everything.
         for name, ident in entries.items():
             seen = self._seen.get(name)
             if seen is None or not seen.ident.same_file(ident):
@@ -257,7 +256,12 @@ class Spool:
     adoption steps are file operations no database check can serialize.
     """
 
-    def __init__(self, inbox: str | Path, spool: str | Path):
+    def __init__(self, inbox: str | Path, spool: str | Path, *, require_no_writers: bool = True):
+        """require_no_writers: refuse to adopt a file while any process has it
+        open for writing. This needs read leases, i.e. the worker must run as
+        the inbox files' owner (the scanner UID); disable it only where leases
+        are unavailable, accepting the stability window as the only guard."""
+        self.require_no_writers = require_no_writers
         self.inbox_fd = fsutil.open_dir(inbox)
         try:
             self.spool_fd = fsutil.open_dir(spool)
@@ -354,6 +358,11 @@ class Spool:
             current.same_file(ident) if quarantine_code else current == ident
         ):
             raise SourceChangedError(name)
+        if not quarantine_code and current.is_regular and self.require_no_writers:
+            # inotify open/close counts are hints (the kernel merges repeated
+            # events); the lease check is the authority on open writers.
+            if fsutil.has_writers(name, self.inbox_fd) is not False:
+                raise SourceChangedError(name)
         job = store.create(
             fsutil.display_name(os.fsencode(name)),
             intake=_intake(name, current, 0, quarantine_code),
