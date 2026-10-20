@@ -665,18 +665,24 @@ class Spool:
             if not gens:
                 self._remove_if_empty(name)
                 continue
-            gen = gens[-1]
-            gen_fd = self.open_input_dir(name, gen)
-            if gen_fd is None:
-                continue
-            try:
-                has_original = fsutil.lstat_at(ORIGINAL, gen_fd) is not None
-                has_incoming = fsutil.lstat_at(INCOMING, gen_fd) is not None
-            finally:
-                os.close(gen_fd)
-            if not has_original and not has_incoming:
+            # The newest generation that still holds an input.
+            found = None
+            for gen in reversed(gens):
+                gen_fd = self.open_input_dir(name, gen)
+                if gen_fd is None:
+                    continue
+                try:
+                    has_original = fsutil.lstat_at(ORIGINAL, gen_fd) is not None
+                    has_incoming = fsutil.lstat_at(INCOMING, gen_fd) is not None
+                finally:
+                    os.close(gen_fd)
+                if has_original or has_incoming:
+                    found = gen, has_original
+                    break
+            if found is None:
                 log.warning("orphan spool directory without an input left alone")
                 continue
+            gen, has_original = found
             if len(gens) > 1:
                 quarantine = "orphaned_generations"
             elif has_original:

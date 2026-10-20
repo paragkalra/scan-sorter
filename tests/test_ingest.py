@@ -1341,3 +1341,15 @@ def test_orphan_with_several_generations_is_quarantined_on_the_latest(dirs, spoo
     assert (job.state, last_code(store, job)) == (State.QUARANTINED, "orphaned_generations")
     assert store.stage_result(doc_id, Stage.INTAKE)["gen"] == 1
     assert original(spool_dir, doc_id, 1).read_bytes() == b"replacement"
+
+
+def test_orphan_whose_newest_generation_is_empty_is_still_registered(dirs, spool, store):
+    _, spool_dir = dirs
+    doc_id = "78" * 16
+    gen_dir(spool_dir, doc_id, 0).mkdir(parents=True)
+    (gen_dir(spool_dir, doc_id, 0) / INCOMING).write_bytes(b"surviving scan")
+    gen_dir(spool_dir, doc_id, 1).mkdir()
+    spool.reconcile(store)
+    job = store.get(doc_id)
+    assert (job.state, last_code(store, job)) == (State.QUARANTINED, "orphaned_generations")
+    assert store.stage_result(doc_id, Stage.INTAKE)["gen"] == 0
