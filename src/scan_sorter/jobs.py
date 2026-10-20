@@ -50,6 +50,7 @@ class FailureKind(StrEnum):
 
 
 class Stage(StrEnum):
+    INTAKE = "intake"  # recorded by create(): where the file came from
     VALIDATE = "validate"
     OCR = "ocr"
     CLASSIFY = "classify"
@@ -412,8 +413,21 @@ class JobStore:
 
     # -- writes --------------------------------------------------------------
 
-    def create(self, source_name: str, *, doc_id: str | None = None) -> Job:
-        """Register a new job in RECEIVED. Committed before the file is moved."""
+    def create(
+        self,
+        source_name: str,
+        *,
+        doc_id: str | None = None,
+        intake: Mapping[str, Any] | None = None,
+        ignore_capacity: bool = False,
+    ) -> Job:
+        """Register a new job in RECEIVED. Committed before the file is moved.
+
+        `intake` (the inbox entry's identity) is stored as the INTAKE stage
+        result in the same transaction, so crash recovery can find the file.
+        ignore_capacity is for recovery of files already in the spool, which
+        must be registered whatever the queue holds.
+        """
         if doc_id is None:
             doc_id = uuid.uuid4().hex
         elif not isinstance(doc_id, str) or len(doc_id) != 32 or doc_id != doc_id.lower():
@@ -426,12 +440,18 @@ class JobStore:
                 raise ValueError("doc_id must be 32 lowercase hex characters") from None
         now = self._clock()
         with self._write() as db:
-            self._check_capacity(db)
+            if not ignore_capacity:
+                self._check_capacity(db)
             db.execute(
                 "INSERT INTO jobs (doc_id, revision, state, source_name, created_at, updated_at)"
                 " VALUES (?,1,?,?,?,?)",
                 (doc_id, State.RECEIVED.value, source_name, now, now),
             )
+            if intake is not None:
+                db.execute(
+                    "INSERT INTO stage_results (doc_id, stage, data, recorded_at) VALUES (?,?,?,?)",
+                    (doc_id, Stage.INTAKE.value, json.dumps(intake, sort_keys=True), now),
+                )
             self._log(db, doc_id, None, State.RECEIVED, None, now)
             created = self._read(db, doc_id)
         return created
@@ -442,6 +462,21 @@ class JobStore:
             raise TransitionError("source hash is recorded at intake")
         with self._write() as db:
             updated = self._cas(db, job, source_hash=source_hash)
+        return updated
+
+    def update_intake(self, job: Job, intake: Mapping[str, Any]) -> Job:
+        """Re-record where a not-yet-adopted input is (it grew before adoption)."""
+        if job.state is not State.RECEIVED or job.source_hash is not None:
+            raise TransitionError("intake can only change before the input is adopted")
+        now = self._clock()
+        with self._write() as db:
+            updated = self._cas(db, job)
+            db.execute(
+                "INSERT INTO stage_results (doc_id, stage, data, recorded_at) VALUES (?,?,?,?)"
+                " ON CONFLICT(doc_id, stage) DO UPDATE"
+                " SET data=excluded.data, recorded_at=excluded.recorded_at",
+                (job.doc_id, Stage.INTAKE.value, json.dumps(intake, sort_keys=True), now),
+            )
         return updated
 
     def set_output_hash(self, job: Job, output_hash: str) -> Job:
@@ -593,7 +628,9 @@ class JobStore:
             self._log(db, job.doc_id, job.state, State.DISCARDED, "discard", now)
         return updated
 
-    def replace(self, job: Job, source_name: str) -> Job:
+    def replace(
+        self, job: Job, source_name: str, *, intake: Mapping[str, Any] | None = None
+    ) -> Job:
         """Restart a quarantined job with a replacement input file.
 
         Everything derived from the old input (hashes, destination, stage
@@ -613,6 +650,11 @@ class JobStore:
                 **dict.fromkeys(_INPUT_COLUMNS),
             )
             db.execute("DELETE FROM stage_results WHERE doc_id=?", (job.doc_id,))
+            if intake is not None:
+                db.execute(
+                    "INSERT INTO stage_results (doc_id, stage, data, recorded_at) VALUES (?,?,?,?)",
+                    (job.doc_id, Stage.INTAKE.value, json.dumps(intake, sort_keys=True), now),
+                )
             self._log(db, job.doc_id, State.QUARANTINED, State.RECEIVED, "replaced", now)
         return updated
 

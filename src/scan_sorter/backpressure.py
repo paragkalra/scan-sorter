@@ -22,6 +22,10 @@ class Admission:
     reason: str | None = None  # "queue_full" or "disk_low" when not admitted
 
 
+def disk_has_room(spool: Path, min_free_bytes: int, disk_usage=shutil.disk_usage) -> bool:
+    return disk_usage(spool).free >= min_free_bytes
+
+
 def admit(
     store: JobStore,
     spool: Path,
@@ -35,7 +39,7 @@ def admit(
     The queue bound is the store's max_active, enforced inside its write
     transaction, so concurrent intake processes cannot overfill it.
     """
-    if disk_usage(spool).free < min_free_bytes:
+    if not disk_has_room(spool, min_free_bytes, disk_usage):
         return Admission(None, "disk_low")
     try:
         return Admission(store.create(source_name))
