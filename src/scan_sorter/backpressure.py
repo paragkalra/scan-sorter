@@ -11,7 +11,7 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
-from scan_sorter.jobs import JobStore
+from scan_sorter.jobs import Job, JobStore, QueueFullError
 
 
 @dataclass(frozen=True)
@@ -21,14 +21,22 @@ class Limits:
 
 
 @dataclass(frozen=True)
-class IntakeDecision:
-    accept: bool
-    reason: str | None = None  # "queue_full" or "disk_low" when not accepting
+class Admission:
+    job: Job | None
+    reason: str | None = None  # "queue_full" or "disk_low" when not admitted
 
 
-def check_intake(store: JobStore, spool: Path, limits: Limits, *, disk_usage=shutil.disk_usage):
-    if store.count_active() >= limits.max_active_jobs:
-        return IntakeDecision(False, "queue_full")
+def admit(
+    store: JobStore, spool: Path, source_name: str, limits: Limits, *, disk_usage=shutil.disk_usage
+) -> Admission:
+    """Create a job for a new inbox file, or say why intake is paused.
+
+    The queue bound is enforced inside the job store's write transaction, so
+    concurrent intake processes cannot overfill it.
+    """
     if disk_usage(spool).free < limits.min_free_bytes:
-        return IntakeDecision(False, "disk_low")
-    return IntakeDecision(True)
+        return Admission(None, "disk_low")
+    try:
+        return Admission(store.create(source_name, max_active=limits.max_active_jobs))
+    except QueueFullError:
+        return Admission(None, "queue_full")
