@@ -257,12 +257,24 @@ class Spool:
     adoption steps are file operations no database check can serialize.
     """
 
-    def __init__(self, inbox: str | Path, spool: str | Path, *, require_no_writers: bool = True):
+    def __init__(
+        self,
+        inbox: str | Path,
+        spool: str | Path,
+        *,
+        require_no_writers: bool = True,
+        stable_seconds: float = 10,
+        wall_clock: Callable[[], float] = time.time,
+    ):
         """require_no_writers: refuse to adopt a file while any process has it
         open for writing. This needs read leases, i.e. the worker must run as
         the inbox files' owner (the scanner UID); disable it only where leases
         are unavailable, accepting the stability window as the only guard."""
         self.require_no_writers = require_no_writers
+        # A registered input that changes before it is moved must then stay
+        # unchanged this long again (wall clock: the wait spans restarts).
+        self.stable_seconds = stable_seconds
+        self.wall_clock = wall_clock
         if require_no_writers:
             fsutil.ignore_lease_signals()
         self.inbox_fd = fsutil.open_dir(inbox)
@@ -414,8 +426,8 @@ class Spool:
             except SourceMissingError:
                 return store.fail(job, FailureKind.PERMANENT, "source_missing")
             except fsutil.WriterActiveError:
-                log.info("job %s waits for a writer to finish", job.doc_id)
-                return job
+                log.info("job %s waits for its input to settle", job.doc_id)
+                return store.get(job.doc_id)
             if code is not None:
                 # Make the moved input durable before the row says where it is.
                 self._barrier(job.doc_id, gen_fd, INCOMING)
@@ -459,13 +471,17 @@ class Spool:
                 raise SourceMissingError(name)  # swapped between lstat and open
             with self._exclusion(fd) as lease:
                 now = Identity.of(os.fstat(fd))
+                intake = store.stage_result(job.doc_id, Stage.INTAKE)
                 if not now.same_content(expected):
-                    # Written to since registration (a deferred job whose
-                    # writer has now closed it): record what we are adopting.
-                    intake = dict(store.stage_result(job.doc_id, Stage.INTAKE))
-                    intake.update(now.as_dict())
-                    job = store.update_intake(job, intake)
-                    expected = now
+                    # Written to since registration (a writer came back): record
+                    # the new state and wait for it to settle again, as the
+                    # transfer gate would have.
+                    intake = {**intake, **now.as_dict(), "changed_at": self.wall_clock()}
+                    store.update_intake(job, intake)
+                    raise fsutil.WriterActiveError
+                changed_at = intake.get("changed_at")
+                if changed_at is not None and self.wall_clock() - changed_at < self.stable_seconds:
+                    raise fsutil.WriterActiveError
                 # The printer's bytes must be durable before the entry leaves
                 # the inbox durably.
                 os.fsync(fd)
@@ -576,12 +592,19 @@ class Spool:
     # -- crash recovery ----------------------------------------------------------------
 
     def reconcile(self, store: JobStore) -> list[str]:
-        """Finish or repair adoptions interrupted by a crash. Returns touched doc ids."""
+        """Finish or repair adoptions interrupted by a crash. Returns touched doc ids.
+
+        A job that hits an OS error (e.g. a full disk) is left RECEIVED for the
+        watcher's per-poll retry; the others still get recovered.
+        """
         touched = []
         for job in store.jobs_in(State.RECEIVED):
             if job.source_hash is None:
                 touched.append(job.doc_id)
-                self.resume(store, job)
+                try:
+                    self.resume(store, job)
+                except OSError as exc:
+                    log.warning("recovery error %s", errno.errorcode.get(exc.errno, "unknown"))
         touched += self._adopt_orphan_dirs(store)
         return touched
 
@@ -738,7 +761,13 @@ class Watcher:
                 log.warning("resume error %s", errno.errorcode.get(exc.errno, "unknown"))
 
     def run(self, stop: threading.Event, *, interval: float = 2.0) -> None:
-        self.spool.reconcile(self.store)
+        # Recovery needs disk like any adoption; without it, polling retries
+        # the unfinished jobs once space is back.
+        if disk_has_room(self.spool.spool_path, self.min_free_bytes, self.disk_usage):
+            try:
+                self.spool.reconcile(self.store)
+            except OSError as exc:
+                log.warning("recovery error %s", errno.errorcode.get(exc.errno, "unknown"))
         while not stop.is_set():
             self.poll_once()
             if self.inotify is not None:
