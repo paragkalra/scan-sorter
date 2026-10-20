@@ -1293,3 +1293,51 @@ def test_orphan_recovery_skipped_for_low_disk_runs_once_space_returns(dirs, spoo
     free[0] = 1 << 40
     w.poll_once()
     assert store.get(doc_id).source_hash == sha(b"sole surviving copy")
+
+
+def test_full_database_pauses_intake_and_recovers(dirs, spool, store, clock):
+    inbox, _ = dirs
+    w = make_watcher(store, spool, clock, use_inotify=False)
+    for i in range(30):
+        write(inbox / f"scan{i:02}.pdf", b"x" * 100)
+    w.poll_once()
+    clock.t += 60
+    pages = store._db.execute("PRAGMA page_count").fetchone()[0]
+    store._db.execute(f"PRAGMA max_page_count={pages}")  # the volume is full
+    report = w.poll_once()  # must not raise
+    assert report.paused == "database_unavailable"
+    store._db.execute("PRAGMA max_page_count=1073741823")
+    for _ in range(3):
+        w.poll_once()
+    assert os.listdir(inbox) == []
+    assert all(j.source_hash for j in store.jobs_in(*State) if j.state is State.RECEIVED)
+
+
+def test_unrelated_database_errors_are_not_swallowed(dirs, spool, store, clock, monkeypatch):
+    import sqlite3
+
+    inbox, _ = dirs
+    w = make_watcher(store, spool, clock, use_inotify=False)
+    write(inbox / "scan.pdf")
+    w.poll_once()
+    clock.t += 60
+
+    def broken(*a, **k):
+        raise sqlite3.OperationalError("no such table: jobs")
+
+    monkeypatch.setattr(store, "create", broken)
+    with pytest.raises(sqlite3.OperationalError):
+        w.poll_once()
+
+
+def test_orphan_with_several_generations_is_quarantined_on_the_latest(dirs, spool, store):
+    _, spool_dir = dirs
+    doc_id = "56" * 16
+    for gen, data in ((0, b"rejected original"), (1, b"replacement")):
+        gen_dir(spool_dir, doc_id, gen).mkdir(parents=True)
+        original(spool_dir, doc_id, gen).write_bytes(data)
+    spool.reconcile(store)
+    job = store.get(doc_id)
+    assert (job.state, last_code(store, job)) == (State.QUARANTINED, "orphaned_generations")
+    assert store.stage_result(doc_id, Stage.INTAKE)["gen"] == 1
+    assert original(spool_dir, doc_id, 1).read_bytes() == b"replacement"

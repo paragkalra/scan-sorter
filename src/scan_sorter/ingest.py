@@ -32,6 +32,7 @@ import logging
 import os
 import select
 import shutil
+import sqlite3
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
@@ -63,6 +64,24 @@ from scan_sorter.jobs import (
 )
 
 log = logging.getLogger(__name__)
+
+_SQLITE_RETRYABLE = ("full", "disk i/o", "locked", "busy", "readonly")
+
+
+def _retryable(exc: BaseException) -> bool:
+    """OS errors, and SQLite errors that mean the storage is (for now) unusable."""
+    if isinstance(exc, OSError):
+        return True
+    return isinstance(exc, sqlite3.OperationalError) and any(
+        m in str(exc).lower() for m in _SQLITE_RETRYABLE
+    )
+
+
+def _error_code(exc: BaseException) -> str:
+    if isinstance(exc, OSError):
+        return errno.errorcode.get(exc.errno, "unknown")
+    return "sqlite_" + str(exc).split()[0].lower() if str(exc) else "sqlite"
+
 
 INCOMING = "incoming"
 ORIGINAL = "original"
@@ -411,6 +430,11 @@ class Spool:
         )
         gen_fd = self.open_input_dir(job.doc_id, gen, create=True)
         try:
+            if quarantine and intake.get("recovered"):
+                # A recovered orphan someone must look at, whatever it holds.
+                held = ORIGINAL if fsutil.lstat_at(ORIGINAL, gen_fd) is not None else INCOMING
+                self._barrier(job.doc_id, gen_fd, held)
+                return store.advance(job, State.QUARANTINED, code=quarantine)
             if fsutil.lstat_at(ORIGINAL, gen_fd) is not None:
                 return self._finish(store, job, gen_fd)
             have_incoming = fsutil.lstat_at(INCOMING, gen_fd) is not None
@@ -603,13 +627,33 @@ class Spool:
                 touched.append(job.doc_id)
                 try:
                     self.resume(store, job)
-                except OSError as exc:
-                    log.warning("recovery error %s", errno.errorcode.get(exc.errno, "unknown"))
+                except (OSError, sqlite3.OperationalError) as exc:
+                    if not _retryable(exc):
+                        raise
+                    log.warning("recovery error %s", _error_code(exc))
         touched += self._adopt_orphan_dirs(store)
         return touched
 
+    def _generations(self, doc_id: str) -> list[int] | None:
+        try:
+            job_fd = fsutil.open_dir(doc_id, dir_fd=self.jobs_fd)
+        except OSError:
+            return None
+        try:
+            return sorted(
+                int(d[1:]) for d in os.listdir(job_fd) if d[:1] == "g" and d[1:].isdigit()
+            )
+        finally:
+            os.close(job_fd)
+
     def _adopt_orphan_dirs(self, store: JobStore) -> list[str]:
-        """Spool directories with no job row (the row was lost): register them."""
+        """Spool directories with no job row (the row was lost): register them.
+
+        Only the simple case continues automatically: a single generation
+        holding a finished private copy. Anything else (an unverified input,
+        several generations where the latest may replace a rejected original)
+        is registered and quarantined for a person to decide.
+        """
         touched = []
         for name in os.listdir(self.jobs_fd):
             try:
@@ -617,36 +661,40 @@ class Spool:
                 continue
             except JobNotFoundError:
                 pass
-            gen_fd = None
-            try:
-                gen_fd = self.open_input_dir(name, 0)
-            except OSError:
-                pass
-            if gen_fd is None:
+            gens = self._generations(name)
+            if not gens:
                 self._remove_if_empty(name)
                 continue
+            gen = gens[-1]
+            gen_fd = self.open_input_dir(name, gen)
+            if gen_fd is None:
+                continue
             try:
-                if fsutil.lstat_at(ORIGINAL, gen_fd) is not None:
-                    quarantine = None  # a finished private copy: carry on normally
-                elif fsutil.lstat_at(INCOMING, gen_fd) is not None:
-                    quarantine = "orphaned_input"  # never verified: a person decides
-                else:
-                    log.warning("orphan spool directory without an input left alone")
-                    continue
-                try:
-                    job = store.create(
-                        "recovered",
-                        doc_id=name,
-                        ignore_capacity=True,
-                        intake={"gen": 0, "quarantine": quarantine, "recovered": True},
-                    )
-                except ValueError:
-                    log.warning("spool directory with an invalid job id left alone")
-                    continue
-                touched.append(job.doc_id)
-                self.resume(store, job)
+                has_original = fsutil.lstat_at(ORIGINAL, gen_fd) is not None
+                has_incoming = fsutil.lstat_at(INCOMING, gen_fd) is not None
             finally:
                 os.close(gen_fd)
+            if not has_original and not has_incoming:
+                log.warning("orphan spool directory without an input left alone")
+                continue
+            if len(gens) > 1:
+                quarantine = "orphaned_generations"
+            elif has_original:
+                quarantine = None  # a finished private copy: carry on normally
+            else:
+                quarantine = "orphaned_input"  # never verified
+            try:
+                job = store.create(
+                    "recovered",
+                    doc_id=name,
+                    ignore_capacity=True,
+                    intake={"gen": gen, "quarantine": quarantine, "recovered": True},
+                )
+            except ValueError:
+                log.warning("spool directory with an invalid job id left alone")
+                continue
+            touched.append(job.doc_id)
+            self.resume(store, job)
         return touched
 
     def _remove_if_empty(self, name: str) -> None:
@@ -736,9 +784,14 @@ class Watcher:
                 break
             except SourceChangedError:
                 continue  # still changing; the gate sees it on the next poll
-            except OSError as exc:
+            except (OSError, sqlite3.OperationalError) as exc:
+                if not _retryable(exc):
+                    raise
                 # One bad entry must not stop intake for everything else.
-                log.warning("adoption error %s", errno.errorcode.get(exc.errno, "unknown"))
+                log.warning("adoption error %s", _error_code(exc))
+                if isinstance(exc, sqlite3.OperationalError):
+                    report.paused = "database_unavailable"
+                    break
                 continue
             if job.state is State.QUARANTINED:
                 report.quarantined.append(job.doc_id)
@@ -759,8 +812,10 @@ class Watcher:
             return
         try:
             self.spool.reconcile(self.store)
-        except OSError as exc:
-            log.warning("recovery error %s", errno.errorcode.get(exc.errno, "unknown"))
+        except (OSError, sqlite3.OperationalError) as exc:
+            if not _retryable(exc):
+                raise
+            log.warning("recovery error %s", _error_code(exc))
             return
         self._recovered = True
 
@@ -773,8 +828,10 @@ class Watcher:
                 continue
             try:
                 self.spool.resume(self.store, job)
-            except OSError as exc:
-                log.warning("resume error %s", errno.errorcode.get(exc.errno, "unknown"))
+            except (OSError, sqlite3.OperationalError) as exc:
+                if not _retryable(exc):
+                    raise
+                log.warning("resume error %s", _error_code(exc))
 
     def run(self, stop: threading.Event, *, interval: float = 2.0) -> None:
         # Recovery needs disk like any adoption; until it has run, every poll
