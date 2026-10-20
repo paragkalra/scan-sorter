@@ -1,9 +1,13 @@
+import io
 import os
+import socket
 import struct
 import sys
+import zlib
 
 import pikepdf
 import pytest
+from PIL import Image
 
 from scan_sorter import sandbox, validate
 from scan_sorter.ingest import Spool
@@ -21,9 +25,17 @@ def make_pdf(path, pages=2, **save):
     return path
 
 
-def png_bytes(width=100, height=50):
-    ihdr = struct.pack(">II", width, height) + b"\x08\x02\x00\x00\x00"
-    return b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + b"IHDR" + ihdr + b"\x00" * 4
+def png_bytes(width=100, height=50, *, depth=8, color=2, crc=None):
+    """PNG signature and IHDR chunk only (validation reads no further)."""
+    body = b"IHDR" + struct.pack(">IIBBBBB", width, height, depth, color, 0, 0, 0)
+    crc = zlib.crc32(body) if crc is None else crc
+    return b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + body + struct.pack(">I", crc)
+
+
+def real_image(fmt, size=(64, 32), **save):
+    buf = io.BytesIO()
+    Image.new("RGB", size, (200, 100, 50)).save(buf, fmt, **save)
+    return buf.getvalue()
 
 
 def jpeg_bytes(width=640, height=480, *, sof=0xC0):
@@ -190,7 +202,8 @@ def test_inspect_images(fd_of):
 @pytest.mark.parametrize(
     ("fake", "code"),
     [
-        (sandbox.Result(None, b"", b""), "parse_timeout"),
+        (sandbox.Result(None, b"", b"", timed_out=True), "parse_timeout"),
+        (sandbox.Result(None, b"x" * 16, b"", output_exceeded=True), "parse_failed"),
         (sandbox.Result(-9, b"", b""), "parse_failed"),
         (sandbox.Result(0, b"not json", b""), "parse_failed"),
         (sandbox.Result(0, b"[1, 2]", b""), "parse_failed"),
@@ -310,3 +323,155 @@ def test_discarded_duplicates_are_not_matched_again(env, tmp_path):
     validate.validate(store, spool, adopt(env, "b.pdf", data))
     third = validate.validate(store, spool, adopt(env, "c.pdf", data))
     assert store.history(third.doc_id)[-1][2] == f"duplicate_of_{first.doc_id}"
+
+
+# -- round 1 regressions ----------------------------------------------------------------
+
+
+def test_real_images_validate(fd_of):
+    for fmt, kind in (("PNG", "png"), ("JPEG", "jpeg")):
+        result, code = inspect(fd_of(real_image(fmt, (64, 32))), validate.DEFAULT_LIMITS)
+        assert code is None
+        assert (result["kind"], result["width"], result["height"]) == (kind, 64, 32)
+
+
+def test_progressive_jpeg_validates(fd_of):
+    data = real_image("JPEG", (40, 30), progressive=True)
+    assert validate.jpeg_size(fd_of(data)) == (40, 30)
+
+
+def test_jpeg_with_large_metadata_before_the_frame_validates(fd_of):
+    data = real_image("JPEG", (2, 3))
+    comment = b"\xff\xfe" + struct.pack(">H", 65535) + b"c" * 65533
+    big = data[:2] + comment * 17 + data[2:]  # more than 1 MiB of comments
+    assert len(big) > 1 << 20
+    assert validate.jpeg_size(fd_of(big)) == (2, 3)
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        png_bytes()[:24],  # signature + dimensions, IHDR incomplete
+        png_bytes(crc=0),  # bad CRC
+        png_bytes(depth=3),  # illegal bit depth
+        png_bytes(color=5),  # illegal colour type
+    ],
+)
+def test_incomplete_or_invalid_png_headers_are_corrupt(fd_of, data):
+    assert validate.png_size(fd_of(data)) is None
+
+
+def test_jpeg_frame_header_length_must_match_components(fd_of):
+    good = jpeg_bytes(10, 10)
+    bad = good.replace(b"\xff\xc0\x00\x11", b"\xff\xc0\x00\x0b")  # too short for 3 parts
+    assert validate.jpeg_size(fd_of(good)) == (10, 10)
+    assert validate.jpeg_size(fd_of(bad)) is None
+
+
+def test_sandbox_child_cannot_truncate_its_input(tmp_path):
+    path = tmp_path / "original"
+    path.write_bytes(b"precious")
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        r = sandbox.run([sys.executable, "-c", "open('/proc/self/fd/0', 'w')"], stdin_fd=fd)
+    finally:
+        os.close(fd)
+    assert r.returncode != 0
+    assert path.read_bytes() == b"precious"
+
+
+def test_sandbox_child_cannot_delete_or_rename(tmp_path):
+    victim = tmp_path / "jobs.sqlite"
+    victim.write_bytes(b"db")
+    for code in (
+        f"import os; os.unlink({str(victim)!r})",
+        f"import os; os.rename({str(victim)!r}, {str(victim)!r} + '.x')",
+    ):
+        assert sandbox.run([sys.executable, "-c", code]).returncode != 0
+    assert victim.read_bytes() == b"db"
+
+
+def test_sandbox_child_cannot_connect_out():
+    with socket.socket() as server:
+        server.bind(("127.0.0.1", 0))
+        server.listen()
+        port = server.getsockname()[1]
+        code = f"import socket; socket.create_connection(('127.0.0.1', {port}), timeout=2)"
+        assert sandbox.run([sys.executable, "-c", code]).returncode != 0
+
+
+def test_sandbox_refuses_to_run_without_landlock(monkeypatch):
+    monkeypatch.setattr(sandbox.landlock, "abi_version", lambda: 0)
+    with pytest.raises(sandbox.SandboxUnavailable):
+        sandbox.run([sys.executable, "-c", "pass"])
+
+
+def test_sandbox_bounds_stdout_and_kills_the_child():
+    r = sandbox.run(
+        [sys.executable, "-c", "import sys; sys.stdout.write('x' * (16 << 20))"],
+        limits=sandbox.Limits(max_output_bytes=16),
+    )
+    assert r.output_exceeded and r.returncode is None
+    assert len(r.stdout) == 16
+
+
+def test_sandbox_keeps_only_a_stderr_tail():
+    r = sandbox.run([sys.executable, "-c", "import sys; sys.stderr.write('e' * (8 << 20) + 'END')"])
+    assert r.returncode == 0
+    assert len(r.stderr_tail) <= 4096 and r.stderr_tail.endswith(b"END")
+
+
+def test_sandbox_times_out_a_child_that_closes_its_pipes():
+    code = "import os, time; os.close(1); os.close(2); time.sleep(30)"
+    r = sandbox.run([sys.executable, "-c", code], limits=sandbox.Limits(timeout_seconds=1))
+    assert r.timed_out
+
+
+def test_racing_duplicates_leave_exactly_one_survivor(env, tmp_path):
+    _, spool, store = env
+    data = pdf_bytes(tmp_path)
+    older = adopt(env, "a.pdf", data)
+    newer = adopt(env, "b.pdf", data)
+    newer = validate.validate(store, spool, newer)  # newer validated first
+    older = validate.validate(store, spool, older)
+    assert (older.state, newer.state) == (State.VALIDATED, State.DISCARDED)
+    assert store.history(newer.doc_id)[-1][2] == f"duplicate_of_{older.doc_id}"
+
+
+def test_racing_duplicates_with_stale_views_agree(env, tmp_path, monkeypatch):
+    # Both validators read the job list before either discards.
+    _, spool, store = env
+    data = pdf_bytes(tmp_path)
+    older = adopt(env, "a.pdf", data)
+    newer = adopt(env, "b.pdf", data)
+    snapshot = store.find_by_source_hash(older.source_hash)
+    monkeypatch.setattr(store, "find_by_source_hash", lambda _h: snapshot)
+    results = [validate.validate(store, spool, j) for j in (newer, older)]
+    assert sorted(j.state for j in results) == [State.DISCARDED, State.VALIDATED]
+
+
+def test_file_again_still_defers_to_an_in_progress_refile(env, tmp_path):
+    _, spool, store = env
+    data = pdf_bytes(tmp_path)
+    _complete(store, adopt(env, "a.pdf", data))
+    second = validate.validate(
+        store, spool, adopt(env, "b.pdf", data), duplicates=DuplicatePolicy.FILE_AGAIN
+    )
+    third = validate.validate(
+        store, spool, adopt(env, "c.pdf", data), duplicates=DuplicatePolicy.FILE_AGAIN
+    )
+    assert (second.state, third.state) == (State.VALIDATED, State.DISCARDED)
+
+
+def test_resuming_a_failed_original_at_the_queue_limit(tmp_path):
+    inbox, spool_dir = tmp_path / "inbox", tmp_path / "spool"
+    inbox.mkdir()
+    spool_dir.mkdir()
+    with Spool(inbox, spool_dir) as spool, JobStore(tmp_path / "q.sqlite", max_active=1) as store:
+        env = (inbox, spool, store)
+        data = pdf_bytes(tmp_path)
+        first = store.fail(adopt(env, "a.pdf", data), FailureKind.RETRYABLE, "timeout")
+        dup = validate.validate(store, spool, adopt(env, "b.pdf", data))
+        assert dup.state is State.DISCARDED
+        assert store.get(first.doc_id).state is State.RECEIVED
+        assert store.count_active() == 1

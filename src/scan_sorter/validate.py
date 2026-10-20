@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import struct
+import zlib
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -51,11 +52,21 @@ def sniff(head: bytes) -> str | None:
     return None
 
 
+_PNG_DEPTHS = {0: {1, 2, 4, 8, 16}, 2: {8, 16}, 3: {1, 2, 4, 8}, 4: {8, 16}, 6: {8, 16}}
+
+
 def png_size(fd: int) -> tuple[int, int] | None:
-    data = os.pread(fd, 24, 0)
-    if len(data) < 24 or data[12:16] != b"IHDR":
+    """Size from a complete, CRC-checked IHDR chunk with legal field values."""
+    data = os.pread(fd, 33, 0)
+    if len(data) < 33 or data[8:16] != b"\x00\x00\x00\x0dIHDR":
         return None
-    width, height = struct.unpack(">II", data[16:24])
+    ihdr = data[16:29]
+    (crc,) = struct.unpack(">I", data[29:33])
+    if zlib.crc32(data[12:29]) != crc:
+        return None
+    width, height, depth, color, compression, filtering, interlace = struct.unpack(">IIBBBBB", ihdr)
+    if depth not in _PNG_DEPTHS.get(color, ()) or compression or filtering or interlace > 1:
+        return None
     return width, height
 
 
@@ -64,29 +75,43 @@ def png_size(fd: int) -> tuple[int, int] | None:
 _SOF = {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
 
 
-def jpeg_size(fd: int, *, max_scan: int = 1 << 20) -> tuple[int, int] | None:
-    """Walk JPEG segments up to the first frame header (bounded read)."""
-    data = os.pread(fd, max_scan, 0)
+def jpeg_size(fd: int) -> tuple[int, int] | None:
+    """Walk JPEG segment headers to the first frame header.
+
+    Reads only each segment's header (positional reads), so metadata of any
+    size before the frame is fine; the walk is bounded by the file size.
+    """
+    size = os.fstat(fd).st_size
+    if os.pread(fd, 2, 0) != b"\xff\xd8":
+        return None
     pos = 2
-    while pos + 4 <= len(data):
-        if data[pos] != 0xFF:
+    while pos + 4 <= size:
+        head = os.pread(fd, 4, pos)
+        if len(head) < 4 or head[0] != 0xFF:
             return None
-        marker = data[pos + 1]
+        marker = head[1]
         if marker == 0xFF:  # fill byte
             pos += 1
             continue
         if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:  # no length
             pos += 2
             continue
-        (length,) = struct.unpack(">H", data[pos + 2 : pos + 4])
-        if length < 2:
+        (length,) = struct.unpack(">H", head[2:4])
+        if length < 2 or pos + 2 + length > size:
             return None
         if marker in _SOF:
-            if pos + 9 > len(data):
+            frame = os.pread(fd, length - 2, pos + 4)
+            if len(frame) < 6:
                 return None
-            height, width = struct.unpack(">HH", data[pos + 5 : pos + 9])
+            precision, height, width, components = struct.unpack(">BHHB", frame[:6])
+            if (
+                precision not in (8, 12, 16)
+                or not 1 <= components <= 4
+                or length != 8 + 3 * components
+            ):
+                return None
             return width, height
-        if marker == 0xDA:  # start of scan before any frame header
+        if marker in (0xDA, 0xD9):  # scan or end of image before any frame header
             return None
         pos += 2 + length
     return None
@@ -144,30 +169,38 @@ def inspect(fd: int, limits: ValidationLimits) -> tuple[dict | None, str | None]
 
 
 def _duplicate(store: JobStore, job: Job, policy: DuplicatePolicy) -> Job | None:
-    """Handle a document seen before. Returns the job if it is done here."""
+    """Handle a document seen before. Returns the job if it is done here.
+
+    Of all live jobs with the same bytes, the oldest one not yet filed is the
+    canonical one and carries on; the others are discarded as its duplicates.
+    The choice depends only on (created_at, doc_id), so two validators racing
+    on the same document agree on it and exactly one proceeds.
+    """
     if job.source_hash is None:
         return None
-    others = [
+    same = [
         o
         for o in store.find_by_source_hash(job.source_hash)
-        if o.doc_id != job.doc_id and o.state is not State.DISCARDED
+        if o.state is not State.DISCARDED or o.doc_id == job.doc_id
     ]
-    if not others:
-        return None
-    filed = [o for o in others if o.state is State.COMPLETE]
-    if filed and policy is DuplicatePolicy.FILE_AGAIN:
-        return None
-    original = filed[0] if filed else others[0]
-    if not filed:
-        # The same document is already in the pipeline: carry on with that
-        # job instead of processing it twice.
-        if original.state is State.FAILED and original.failure_kind is FailureKind.RETRYABLE:
-            try:
-                store.retry(original)
-            except QueueFullError:
-                pass  # retried by the person later; the duplicate still goes
-    log.info("job %s is a duplicate of %s", job.doc_id, original.doc_id)
-    return store.advance(job, State.DISCARDED, code=f"duplicate_of_{original.doc_id}")
+    same.sort(key=lambda o: (o.created_at, o.doc_id))
+    filed = [o for o in same if o.state is State.COMPLETE]
+    pending = [o for o in same if o.state is not State.COMPLETE]
+    if filed and policy is DuplicatePolicy.SKIP:
+        canonical = filed[0]
+    elif pending[0].doc_id == job.doc_id:
+        return None  # this job is the one that goes ahead
+    else:
+        canonical = pending[0]
+    log.info("job %s is a duplicate of %s", job.doc_id, canonical.doc_id)
+    done = store.advance(job, State.DISCARDED, code=f"duplicate_of_{canonical.doc_id}")
+    # Discarding first frees this job's queue slot for the one it defers to.
+    if canonical.state is State.FAILED and canonical.failure_kind is FailureKind.RETRYABLE:
+        try:
+            store.retry(canonical)
+        except QueueFullError:
+            pass  # still listed as a retryable failure for a person to retry
+    return done
 
 
 def validate(
