@@ -1,5 +1,5 @@
 # Printer-facing SMB share. Pinned by digest (alpine 3.24.2).
-FROM alpine:3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
+FROM alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
 
 # UID/GID must match the worker so it can rename scans out of the inbox.
 ARG SCANNER_UID=10001
